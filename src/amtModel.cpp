@@ -70,12 +70,18 @@ std::vector<Note> amtModel::transcribeAudio( const Vectorf& audio ) {
     _Yo_buffer.resize(audio_windowed.size());
     const int max_threads = std::getenv("OMP_NUM_THREADS") ? atoi(std::getenv("OMP_NUM_THREADS")) : 1;
     std::vector<std::thread> threads(max_threads);
+    std::vector<PthreadArg*> args_to_delete;
+    // PthreadArg objects are dynamically allocated for each thread.
+    // These objects need to be manually deallocated after the threads are joined to prevent memory leaks.
+    // args_to_delete vector stores the pointers to these objects for later deallocation.
     for ( int i = 0 ; i < audio_windowed.size() ; ) {
         int used_threads = 0;
+        args_to_delete.reserve(max_threads);
         while ( used_threads < max_threads && i < audio_windowed.size() ) {
             PthreadArg* arg = new PthreadArg;
             arg->audio = &audio_windowed[i];
             arg->idx = i;
+            args_to_delete.push_back(arg); // Store pointer for deallocation
             threads[used_threads] = std::thread(&amtModel::inferenceFramePthread, this, arg);
             i++;
             used_threads++;
@@ -83,6 +89,11 @@ std::vector<Note> amtModel::transcribeAudio( const Vectorf& audio ) {
         for ( int j = 0 ; j < used_threads ; j++ ) {
             threads[j].join();
         }
+        // Deallocate PthreadArg objects
+        for ( int j = 0 ; j < used_threads ; j++ ) {
+            delete args_to_delete[j]; // Deallocate the PthreadArg object
+        }
+        args_to_delete.clear();
     }
     threads.clear();
 #else
