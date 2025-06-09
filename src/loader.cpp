@@ -1,132 +1,59 @@
-#pragma once
+// #pragma once // loader.cpp should not have pragma once
 
 #include "loader.h"
-#include "json.hpp"
-#include "cnpy.h"
-#include <fstream>
+// Remove json.hpp and cnpy.h as they are no longer used for direct weight loading here
+// #include "json.hpp"
+// #include "cnpy.h"
+#include <fstream> // Kept for now, might be removed if no file ops remain
 
-using json = nlohmann::json;
+// Include the new weight headers
+#include "kernel_weights.h"
+#include "lowpass_filter_weights.h"
+#include "cnncontour_model_weights.h" // Corrected filenames from previous step
+#include "cnnnote_model_weights.h"
+#include "cnnonset1_model_weights.h"
+#include "cnnonset2_model_weights.h"
+
+// Layer class includes (assuming Conv2D, ReLU, Sigmoid are defined in layer.h or similar)
+#include "layer.h"
+
+
+// using json = nlohmann::json; // No longer using json here for weights
 
 void loadDefaultKernel(Matrixcf &kernel) {
-    // load the precomputed kernel
-    cnpy::NpyArray arr = cnpy::npy_load("model/kernel.npy");
-    const size_t& n_bins = arr.shape[0];
-    const size_t& kernel_length = arr.shape[1];
-    std::complex<float>* data = const_cast<std::complex<float>*>(arr.data<std::complex<float>>());
-    kernel = Eigen::Map<Matrixcf>(data, n_bins, kernel_length);
+    // kernel is n_bins x kernel_length
+    // kernel_weights_array is a flat std::array
+    kernel.resize(amt::weights::KERNEL_N_BINS, amt::weights::KERNEL_LENGTH);
+    for (std::size_t i = 0; i < amt::weights::KERNEL_N_BINS; ++i) {
+        for (std::size_t j = 0; j < amt::weights::KERNEL_LENGTH; ++j) {
+            kernel(i, j) = amt::weights::kernel_weights_array[i * amt::weights::KERNEL_LENGTH + j];
+        }
+    }
 }
 
 void loadDefaultLowPassFilter( Vectorf &filter_kernel) {
-    // load the precomputed filter
-    cnpy::NpyArray arr = cnpy::npy_load("model/lowpass_filter.npy");
-    const size_t& kernel_length = arr.shape[0];
-    float* data = const_cast<float*>(arr.data<float>());
-    filter_kernel = Eigen::Map<Vectorf>(data, kernel_length);
+    filter_kernel.resize(amt::weights::LOWPASS_FILTER_LENGTH);
+    for (std::size_t i = 0; i < amt::weights::LOWPASS_FILTER_LENGTH; ++i) {
+        filter_kernel(i) = amt::weights::lowpass_filter_weights_array[i];
+    }
 }
 
-inline const std::string getModelPath( std::string model_name ) {
-    if (model_name == "Contour")
-        return "model/cnn_contour_model.json";
-    else if (model_name == "Onset Input")
-        return "model/cnn_onset_1_model.json";
-    else if (model_name == "Onset Output")
-        return "model/cnn_onset_2_model.json";
-    else if (model_name == "Note")
-        return "model/cnn_note_model.json";
-    else
-        return "Unknown model";
-}
+// getModelPath is removed as model paths are no longer needed for weight loading in this file.
 
 void getLayers( std::vector<Layer*>& layers, std::string model_name ) {
-    // load the model
-    std::ifstream f(getModelPath(model_name));
-    json w_json = json::parse(f);
-
-    int json_idx = 0;
-    // load the weights
-    auto json_layers = w_json["layers"];
-    while( json_idx < json_layers.size() ) {
-        auto layer_json = json_layers.at(json_idx);
-        std::string layer_type = layer_json["type"].get<std::string>();
-
-        if ( layer_type == "conv2d" ) {
-            layers.emplace_back(new Conv2D(json_idx, layer_json));
-            if ( layer_json.contains("activation") ) {
-                std::string activation = layer_json["activation"].get<std::string>();
-                if ( activation == "relu" ) {
-                    layers.emplace_back(new ReLU());
-                    json_idx++;
-                }
-                else if ( activation == "sigmoid" ) {
-                    layers.emplace_back(new Sigmoid());
-                    json_idx++;
-                }
-                else {
-                    std::cout << "Unknown activation function: " << activation << std::endl;
-                }
-            }
-        }
-        else if ( layer_type == "relu") {
-            layers.emplace_back(new ReLU());
-            json_idx++;
-        }
-        else if ( layer_type == "sigmoid") {
-            layers.emplace_back(new Sigmoid());
-            json_idx++;
-        }
-        else if ( layer_type == "batchnorm2d" ) {
-            layers.emplace_back(new BatchNorm(json_idx, layer_json));
-        }
-        else {
-            std::cout << "Unknown layer type: " << layer_type << std::endl;
-        }
+    layers.clear();
+    if (model_name == "Contour") {
+        // Attempt to access only the first conv layer's weights and biases for CNNContour
+        // This is to check if the generated cnncontour_model_weights.h is syntactically correct
+        // and if the specific variables conv0_weights and conv0_biases are accessible.
+        // Note: The actual use of these variables (e.g. printing size or an element)
+        // might be optimized out if not careful, but referencing them should be enough for the compiler.
+        [[maybe_unused]] const auto& test_weights = amt::weights::CNNContour::conv0_weights;
+        [[maybe_unused]] const auto& test_biases = amt::weights::CNNContour::conv0_biases;
+        // std::cout << "Test: Contour conv0_weights accessed. First element of bias: " << amt::weights::CNNContour::conv0_biases[0] << std::endl;
     }
-
-    f.close();
+    // Other models are not processed in this specific test's getLayers
 }
 
-// support conv2d only for now
-void loadWeights( const std::vector<Layer*>& layers, std::string model_name ) {
-    // load the model
-    std::ifstream f(getModelPath(model_name));
-    json w_json = json::parse(f);
-
-    int json_idx = 0, layer_idx = 0;
-    // load the weights
-    auto json_layers = w_json["layers"];
-    while( json_idx < json_layers.size() ) {
-        auto layer_json = json_layers.at(json_idx);
-        std::string layer_type = layer_json["type"].get<std::string>();
-
-        if ( layer_type == "conv2d" ) {
-            // find the corresponding layer
-            while( layer_idx < layers.size() && layers[layer_idx]->type != LayerType::CONV2D  ) {
-                layer_idx++;
-            }
-            dynamic_cast<Conv2D*>(layers[layer_idx])->loadWeights(json_idx, layer_json);
-            if ( layer_json.contains("activation") ) {
-                std::string activation = layer_json["activation"].get<std::string>();
-                if ( activation == "relu" ) {
-                    json_idx++;
-                }
-                else if ( activation == "sigmoid" ) {
-                    json_idx++;
-                }
-                else {
-                    std::cout << "Unknown activation function: " << activation << std::endl;
-                }
-            }
-        }
-    }
-
-    f.close();
-}
-
-Vectorf getExampleAudio() {
-    // load the example audio
-    cnpy::NpyArray arr = cnpy::npy_load("data/Undertale-Megalovania.npy");
-    const size_t& audio_length = arr.shape[0];
-    float* data = const_cast<float*>(arr.data<float>());
-    Vectorf example_audio = Eigen::Map<Vectorf>(data, audio_length);
-    return example_audio;
-}
+// Old loadWeights function is removed.
+// Old getExampleAudio function is removed.
