@@ -19,6 +19,9 @@ inline constexpr int kModelSampleRate = 22050;
 inline constexpr int kNoteBinCount = 88;
 inline constexpr int kContourBinCount = 264;
 
+// Number of output frames basic-pitch produces for n_samples of 22050 Hz audio.
+int frame_count(size_t n_samples);
+
 // Frame-level model output, row-major [n_frames][bins], 86.13 frames per second.
 struct ModelOutput {
     int n_frames = 0;

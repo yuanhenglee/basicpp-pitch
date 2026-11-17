@@ -69,3 +69,25 @@ def test_invalid_midi_tempo():
     out = bpp.Engine(1).infer(np.zeros(50000, np.float32))
     with pytest.raises(RuntimeError):
         bpp.output_to_notes(out, bpp.NoteOptions(midi_tempo=0))
+
+
+def _cli():
+    exe = ROOT / "build" / ("bpp.exe" if sys.platform == "win32" else "bpp")
+    if not exe.exists():
+        pytest.skip("CLI not built")
+    return str(exe)
+
+
+@pytest.mark.parametrize("args", [
+    ["bench", "--repeat", "0"],
+    ["stream", "--chunk-ms", "-5"],
+    ["transcribe", "--maximum-frequency", "0"],
+    ["transcribe", "--minimum-frequency", "-10"],
+])
+def test_cli_rejects_invalid_arguments(args):
+    import subprocess
+
+    wav = ROOT / "tests" / "fixtures" / "megalovania_6s.wav"
+    r = subprocess.run([_cli(), args[0], str(wav), *args[1:]], capture_output=True, text=True)
+    assert r.returncode in (1, 2), r  # clean error, not a crash
+    assert "error" in (r.stderr + r.stdout).lower() or "usage" in r.stderr.lower()

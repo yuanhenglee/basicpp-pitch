@@ -25,9 +25,12 @@ namespace detail {
 WavAudio decode_wav(const std::string& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) throw std::runtime_error("cannot open " + path);
-    std::vector<uint8_t> bytes(static_cast<size_t>(f.tellg()));
+    const std::streamoff size = f.tellg();
+    if (size < 0) throw std::runtime_error("cannot read " + path);
+    std::vector<uint8_t> bytes(static_cast<size_t>(size));
     f.seekg(0);
     f.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (f.gcount() != static_cast<std::streamsize>(bytes.size())) throw std::runtime_error("short read on " + path);
     if (bytes.size() < 12 || std::memcmp(bytes.data(), "RIFF", 4) || std::memcmp(bytes.data() + 8, "WAVE", 4))
         throw std::runtime_error(path + ": not a RIFF/WAVE file");
 

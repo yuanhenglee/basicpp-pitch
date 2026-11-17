@@ -29,7 +29,9 @@ _LIB_NAMES = {"win32": "basicpp_pitch.dll", "darwin": "basicpp_pitch.dylib"}
 def _find_library() -> ctypes.CDLL:
     name = _LIB_NAMES.get(sys.platform, "basicpp_pitch.so")
     here = pathlib.Path(__file__).resolve().parent
-    candidates = [os.environ.get("BASICPP_PITCH_LIB", ""), here / name, here.parent.parent / "build" / name]
+    build = here.parent.parent / "build"
+    candidates = [os.environ.get("BASICPP_PITCH_LIB", ""), here / name, build / name]
+    candidates += [build / cfg / name for cfg in ("Release", "RelWithDebInfo", "MinSizeRel", "Debug")]
     for c in candidates:
         if c and pathlib.Path(c).exists():
             return ctypes.CDLL(str(c))

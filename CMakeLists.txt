@@ -8,7 +8,14 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Instruction set for the kernels. x86-64-v3 = AVX2 + FMA (Haswell / Zen and newer).
-set(BPP_ARCH "x86-64-v3" CACHE STRING "Value for -march (e.g. native, x86-64-v3, x86-64 for a scalar build)")
+# Default: AVX2 + FMA on x86-64, the compiler's default elsewhere (scalar kernels, e.g. ARM).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64)$")
+  set(_bpp_default_arch "x86-64-v3")
+else()
+  set(_bpp_default_arch "")
+endif()
+set(BPP_ARCH "${_bpp_default_arch}" CACHE STRING
+    "Value for -march (native, x86-64-v3, x86-64 for a scalar build; empty = compiler default). MSVC: x86-64-v3/native -> /arch:AVX2")
 set(_bpp_march "${BPP_ARCH}")
 if(BPP_ZIG_TOOLCHAIN)
   string(REPLACE "-" "_" _bpp_march "${_bpp_march}")  # zig spells CPU models x86_64_v3
@@ -28,10 +35,16 @@ set_target_properties(bpp_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_definitions(bpp_core PRIVATE BPP_BUILDING_LIBRARY)
 
 if(MSVC)
-  target_compile_options(bpp_core PRIVATE /O2 /fp:precise /arch:AVX2 /W3)
+  target_compile_options(bpp_core PRIVATE /O2 /fp:precise /W3)
+  if(BPP_ARCH MATCHES "^(x86-64-v3|x86-64-v4|native)$")
+    target_compile_options(bpp_core PRIVATE /arch:AVX2)
+  endif()
 else()
   # No implicit FMA contraction: scalar code must round exactly like NumPy; kernels use explicit FMA.
-  target_compile_options(bpp_core PRIVATE -O3 -march=${_bpp_march} -ffp-contract=off -fno-math-errno -Wall -Wextra)
+  target_compile_options(bpp_core PRIVATE -O3 -ffp-contract=off -fno-math-errno -Wall -Wextra)
+  if(_bpp_march)
+    target_compile_options(bpp_core PRIVATE -march=${_bpp_march})
+  endif()
 endif()
 
 # libsoxr (LGPL-2.1), configured like python-soxr 1.1 so resampling matches librosa.load bit for bit.
@@ -93,6 +106,9 @@ if(BPP_BUILD_DEBUG_TOOLS)
   target_include_directories(window_dump PRIVATE src)
   target_link_libraries(window_dump PRIVATE bpp)
   if(NOT MSVC)
-    target_compile_options(window_dump PRIVATE -O2 -march=${_bpp_march} -ffp-contract=off)
+    target_compile_options(window_dump PRIVATE -O2 -ffp-contract=off)
+    if(_bpp_march)
+      target_compile_options(window_dump PRIVATE -march=${_bpp_march})
+    endif()
   endif()
 endif()

@@ -156,7 +156,8 @@ std::vector<uint8_t> notes_to_midi(const std::vector<NoteEvent>& notes, const No
             it = inst_events.emplace(key, std::vector<Event>{}).first;
         }
         std::vector<Event>& ev = it->second;
-        const int velocity = static_cast<int>(std::nearbyint(127.0f * m.amplitude));
+        // int(np.round(127 * amplitude)): NumPy 1.x promotes the float32 scalar product to float64
+        const int velocity = static_cast<int>(std::nearbyint(127.0 * double(m.amplitude)));
         ev.push_back({to_tick(m.start), kNoteOn, m.pitch, velocity});
         ev.push_back({to_tick(m.end), kNoteOn, m.pitch, 0});
         if (!m.bends) continue;

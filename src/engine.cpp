@@ -18,6 +18,10 @@
 
 namespace bpp {
 
+int frame_count(size_t n_samples) {
+    return static_cast<int>(std::floor(static_cast<double>(n_samples) * (double(kAnnotationsFps) / kSampleRate)));
+}
+
 namespace {
 
 using detail::FloatBuffer;
@@ -28,9 +32,7 @@ using detail::Workspace;
 constexpr int kLeadPad = kOverlapSamples / 2;  // 3840
 
 // int(np.floor(n_samples * (ANNOTATIONS_FPS / AUDIO_SAMPLE_RATE)))
-int output_frame_count(size_t n_samples) {
-    return static_cast<int>(std::floor(static_cast<double>(n_samples) * (double(kAnnotationsFps) / kSampleRate)));
-}
+int output_frame_count(size_t n_samples) { return frame_count(n_samples); }
 
 // Windows start every kWindowHop samples of the padded signal: range(0, n + 3840, hop).
 int window_count(size_t n_samples) {
@@ -66,22 +68,33 @@ void resize_output(ModelOutput& out, int frames) {
     out.contour.resize(size_t(frames) * kContourBins);
 }
 
-// Runs window w and stores its kept frames at frame offset w * 142, clipped to out.n_frames.
-void run_window(const float* window, int w, Workspace& ws, ModelOutput& out, float* tmp,
-                const detail::RowRunner* runner = nullptr) {
-    const int first = w * kUsedFrames;
-    const int rows = std::min(kUsedFrames, out.n_frames - first);
-    if (rows <= 0) return;
+constexpr size_t kTmpFloats = size_t(kUsedFrames) * (kContourBins + 2 * kNoteBins);
+
+// Kept frames of one window, in the caller's scratch buffer (kTmpFloats floats).
+struct WindowFrames {
+    const float* contour;  // [142][264]
+    const float* note;     // [142][88]
+    const float* onset;    // [142][88]
+};
+
+WindowFrames compute_window(const float* window, Workspace& ws, float* tmp, const detail::RowRunner* runner) {
     float* contour = tmp;
     float* note = contour + kUsedFrames * kContourBins;
     float* onset = note + kUsedFrames * kNoteBins;
     WindowModel::get().run(window, ws, contour, note, onset, runner);
+    return {contour, note, onset};
+}
+
+// Runs window w and stores its kept frames at frame offset w * 142, clipped to out.n_frames.
+void run_window(const float* window, int w, Workspace& ws, ModelOutput& out, float* tmp) {
+    const int first = w * kUsedFrames;
+    const int rows = std::min(kUsedFrames, out.n_frames - first);
+    if (rows <= 0) return;
+    const auto [contour, note, onset] = compute_window(window, ws, tmp, nullptr);
     std::memcpy(out.contour.data() + size_t(first) * kContourBins, contour, sizeof(float) * rows * kContourBins);
     std::memcpy(out.note.data() + size_t(first) * kNoteBins, note, sizeof(float) * rows * kNoteBins);
     std::memcpy(out.onset.data() + size_t(first) * kNoteBins, onset, sizeof(float) * rows * kNoteBins);
 }
-
-constexpr size_t kTmpFloats = size_t(kUsedFrames) * (kContourBins + 2 * kNoteBins);
 
 // Per-thread state reused across windows and calls.
 struct ThreadState {
@@ -323,14 +336,18 @@ struct Stream::Impl {
             const long long idx = start + i - buffer_start;
             win[i] = idx < static_cast<long long>(buffer.size()) ? buffer[idx] : 0.0f;
         }
-        float* contour = state.tmp.data();
-        float* note = contour + kUsedFrames * kContourBins;
-        float* onset = note + kUsedFrames * kNoteBins;
-        WindowModel::get().run(win, state.ws, contour, note, onset, n_threads > 1 ? &runner : nullptr);
-        out.n_frames += kUsedFrames;
+        const auto [contour, note, onset] = compute_window(win, state.ws, state.tmp.data(), n_threads > 1 ? &runner : nullptr);
+        // reserve first so a failed allocation leaves the stream unchanged; inserts then cannot throw
+        auto grow = [](std::vector<float>& v, size_t extra) {
+            if (v.capacity() < v.size() + extra) v.reserve(std::max(v.size() + extra, 2 * v.capacity()));
+        };
+        grow(out.contour, size_t(kUsedFrames) * kContourBins);
+        grow(out.note, size_t(kUsedFrames) * kNoteBins);
+        grow(out.onset, size_t(kUsedFrames) * kNoteBins);
         out.contour.insert(out.contour.end(), contour, contour + kUsedFrames * kContourBins);
         out.note.insert(out.note.end(), note, note + kUsedFrames * kNoteBins);
         out.onset.insert(out.onset.end(), onset, onset + kUsedFrames * kNoteBins);
+        out.n_frames += kUsedFrames;
 
         // drop samples no later window needs
         const long long keep_from = static_cast<long long>(w + 1) * kWindowHop;
@@ -353,8 +370,10 @@ int Stream::push(const float* audio, size_t n) {
     s.buffer.insert(s.buffer.end(), audio, audio + n);
     s.n_samples += n;
     s.padded_len += static_cast<long long>(n);
-    while (static_cast<long long>(s.next_window) * kWindowHop + kWindowSamples <= s.padded_len)
-        s.process(s.next_window++);
+    while (static_cast<long long>(s.next_window) * kWindowHop + kWindowSamples <= s.padded_len) {
+        s.process(s.next_window);
+        ++s.next_window;  // only after the window's frames are stored
+    }
     return s.out.n_frames - before;
 }
 
@@ -364,7 +383,10 @@ int Stream::finish() {
     s.finished = true;
     const int before = s.out.n_frames;
     const int n_windows = useful_window_count(s.n_samples);
-    while (s.next_window < n_windows) s.process(s.next_window++);
+    while (s.next_window < n_windows) {
+        s.process(s.next_window);
+        ++s.next_window;
+    }
     // basic-pitch keeps floor(n_samples * 86 / 22050) frames; the unwrapped grid runs slightly ahead
     resize_output(s.out, std::min(s.out.n_frames, output_frame_count(s.n_samples)));
     s.buffer.clear();

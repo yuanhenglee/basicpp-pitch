@@ -96,3 +96,53 @@ def test_stream_equals_offline(chunk):
 def test_empty_and_tiny_audio():
     assert bpp.predict(np.zeros(0, np.float32)).note_events == []
     assert bpp.predict(np.zeros(100, np.float32)).note_events == []
+
+
+def _basic_pitch_decode(model_output, opt):
+    import io
+
+    import basic_pitch.note_creation as infer
+    from basic_pitch.constants import AUDIO_SAMPLE_RATE, FFT_HOP
+
+    min_note_len = int(np.round(opt.minimum_note_length / 1000 * (AUDIO_SAMPLE_RATE / FFT_HOP)))
+    midi, events = infer.model_output_to_notes(
+        {k: v.copy() for k, v in model_output.items()}, onset_thresh=opt.onset_threshold,
+        frame_thresh=opt.frame_threshold, min_note_len=min_note_len, min_freq=opt.minimum_frequency,
+        max_freq=opt.maximum_frequency, multiple_pitch_bends=opt.multiple_pitch_bends,
+        melodia_trick=opt.melodia_trick, midi_tempo=opt.midi_tempo)
+    buf = io.BytesIO()
+    midi.write(buf)
+    return [[float(s), float(e), int(p), float(a), [int(x) for x in b] if b else None] for s, e, p, a, b in events], buf.getvalue()
+
+
+@pytest.mark.parametrize("amp", [0.751968502998352, 0.6732283234596252, 0.7992125749588013])
+def test_velocity_rounding_uses_float64(amp):
+    # float32(127 * amp) is exactly k + 0.5 (k odd) while the float64 product is just below it;
+    # NumPy 1.x rounds the float64 value. 16 equal frames make the float32 mean exactly amp.
+    pytest.importorskip("basic_pitch")
+    n = 200
+    note = np.zeros((n, 88), np.float32)
+    note[50:66, 40] = np.float32(amp)
+    onset = np.zeros((n, 88), np.float32)
+    onset[50, 40] = 0.9
+    out = {"note": note, "onset": onset, "contour": np.zeros((n, 264), np.float32)}
+    opt = bpp.NoteOptions(melodia_trick=False)
+    events, midi = _basic_pitch_decode(out, opt)
+    got = bpp.output_to_notes(out, opt)
+    assert [e[3] for e in events] == [np.float32(amp)]
+    assert as_json_notes(got.note_events) == events
+    assert got.midi_bytes == midi
+
+
+def test_nonpositive_onset_threshold_on_flat_activations():
+    # max(frame_diff) == 0 -> NaN onsets in NumPy; with a threshold <= 0 every cell is a candidate
+    pytest.importorskip("basic_pitch")
+    n = 120
+    note = np.full((n, 88), 0.4, np.float32)
+    out = {"note": note, "onset": np.zeros((n, 88), np.float32), "contour": np.zeros((n, 264), np.float32)}
+    opt = bpp.NoteOptions(onset_threshold=0.0)
+    events, midi = _basic_pitch_decode(out, opt)
+    got = bpp.output_to_notes(out, opt)
+    assert len(events) > 0
+    assert as_json_notes(got.note_events) == events
+    assert got.midi_bytes == midi

@@ -78,6 +78,10 @@ Args parse(int argc, char** argv) {
         else if (k == "--midi-tempo") a.notes.midi_tempo = std::stod(next());
         else usage();
     }
+    if (a.threads < 0 || a.repeat < 1 || !(a.chunk_ms > 0) || !(a.chunk_ms < 1e7)) {
+        std::fprintf(stderr, "error: --threads must be >= 0, --repeat >= 1 and --chunk-ms > 0\n");
+        std::exit(2);
+    }
     return a;
 }
 
@@ -151,7 +155,7 @@ void write_csv(const std::string& path, const std::vector<bpp::NoteEvent>& notes
     std::string s = "start_time_s,end_time_s,pitch_midi,velocity,pitch_bend\r\n";
     for (const auto& n : notes) {
         s += py_repr(n.start_s) + "," + py_repr(n.end_s) + "," + std::to_string(n.pitch) + "," +
-             std::to_string(static_cast<int>(std::nearbyint(127.0f * n.amplitude)));
+             std::to_string(static_cast<int>(std::nearbyint(127.0 * double(n.amplitude))));
         for (int b : n.pitch_bends) s += "," + std::to_string(b);
         s += "\r\n";
     }

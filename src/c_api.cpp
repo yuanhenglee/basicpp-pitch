@@ -55,10 +55,12 @@ bpp::NoteOptions to_cpp(const bpp_note_options* o) {
     return r;
 }
 
+constexpr size_t kNote = bpp::kNoteBinCount, kContour = bpp::kContourBinCount;
+
 void copy_frames(const bpp::ModelOutput& out, int first, int count, float* note, float* onset, float* contour) {
-    std::memcpy(note, out.note.data() + size_t(first) * 88, sizeof(float) * size_t(count) * 88);
-    std::memcpy(onset, out.onset.data() + size_t(first) * 88, sizeof(float) * size_t(count) * 88);
-    std::memcpy(contour, out.contour.data() + size_t(first) * 264, sizeof(float) * size_t(count) * 264);
+    std::memcpy(note, out.note.data() + size_t(first) * kNote, sizeof(float) * size_t(count) * kNote);
+    std::memcpy(onset, out.onset.data() + size_t(first) * kNote, sizeof(float) * size_t(count) * kNote);
+    std::memcpy(contour, out.contour.data() + size_t(first) * kContour, sizeof(float) * size_t(count) * kContour);
 }
 
 }  // namespace
@@ -82,7 +84,7 @@ void bpp_note_options_default(bpp_note_options* o) {
 }
 
 int bpp_frame_count(size_t n_samples) {
-    return static_cast<int>(static_cast<double>(n_samples) * (86.0 / 22050.0));
+    return bpp::frame_count(n_samples);
 }
 
 bpp_engine* bpp_engine_new(int n_threads) {
@@ -158,9 +160,9 @@ bpp_notes* bpp_notes_decode(const float* note, const float* onset, const float* 
             if (n_frames < 0) throw std::invalid_argument("n_frames must be >= 0");
             bpp::ModelOutput out;
             out.n_frames = n_frames;
-            out.note.assign(note, note + size_t(n_frames) * 88);
-            out.onset.assign(onset, onset + size_t(n_frames) * 88);
-            out.contour.assign(contour, contour + size_t(n_frames) * 264);
+            out.note.assign(note, note + size_t(n_frames) * kNote);
+            out.onset.assign(onset, onset + size_t(n_frames) * kNote);
+            out.contour.assign(contour, contour + size_t(n_frames) * kContour);
             auto* r = new bpp_notes;
             r->notes = bpp::output_to_notes(out, to_cpp(options));
             return r;

@@ -78,6 +78,13 @@ int py_slice_index(int idx, int len) {
 
 double hz_to_midi(double hz) { return 12.0 * (std::log2(hz) - std::log2(440.0)) + 69.0; }
 
+// int(np.round(librosa.hz_to_midi(hz) - 21)); Python raises for 0, negative or non-finite input.
+int frequency_column(double hz) {
+    if (!(hz > 0.0) || !std::isfinite(hz)) throw std::invalid_argument("frequency limits must be positive and finite");
+    const double v = std::nearbyint(hz_to_midi(hz) - kMidiOffset);
+    return static_cast<int>(std::clamp(v, -1e6, 1e6));
+}
+
 // model_frames_to_time(): frame index -> seconds, with basic-pitch's per-window offset correction.
 double frame_time(int frame) {
     const double original = static_cast<double>(static_cast<long long>(frame) * kFftHop) / double(kSampleRate);
@@ -140,7 +147,13 @@ std::vector<RawNote> output_to_notes_polyphonic(const float* frame, const float*
     // scipy.signal.argrelmax(onsets, axis=0) (edges clipped), then threshold; rows are produced
     // on the fly in a 3-row window. Onsets are visited backwards in time.
     std::vector<std::pair<int, int>> onset_idx;
-    if (!all_nan) {
+    if (all_nan) {
+        // NaN onsets have no peaks; peak_thresh_mat stays all zero and np.where(0 >= thresh)
+        // selects every cell when the threshold is <= 0
+        if (0.0 >= opt.onset_threshold)
+            for (int t = 0; t < n_frames; ++t)
+                for (int f = 0; f < F; ++f) onset_idx.emplace_back(t, f);
+    } else {
         double buf[3][kNoteBins];
         double *prev = buf[0], *cur = buf[1], *next = buf[2];
         onset_row(0, cur);
@@ -242,13 +255,11 @@ std::vector<RawNote> output_to_notes_polyphonic(const float* frame, const float*
 }
 
 std::vector<int> pitch_bends(const std::vector<float>& contour, const RawNote& n) {
-    constexpr int W = 2 * kBinsTolerance + 1;
     const int freq_idx = 3 * (n.pitch - kMidiOffset);  // round(midi_pitch_to_contour_bin(pitch))
     const int f0 = std::max(freq_idx - kBinsTolerance, 0);
     const int f1 = std::min(kContourBins, freq_idx + kBinsTolerance + 1);
     const int g0 = std::max(0, kBinsTolerance - freq_idx);
     const int shift = kBinsTolerance - std::max(0, kBinsTolerance - freq_idx);
-    (void)W;
     std::vector<int> bends;
     bends.reserve(std::max(0, n.end - n.start));
     for (int t = n.start; t < n.end; ++t) {
@@ -294,9 +305,9 @@ std::vector<NoteEvent> output_to_notes(const ModelOutput& output, const NoteOpti
                 for (int f = f0; f < f1; ++f) onsets_c[size_t(t) * F + f] = frames_c[size_t(t) * F + f] = 0.0f;
         };
         if (opt.maximum_frequency)
-            zero_cols(py_slice_index(static_cast<int>(std::nearbyint(hz_to_midi(*opt.maximum_frequency) - kMidiOffset)), F), F);
+            zero_cols(py_slice_index(frequency_column(*opt.maximum_frequency), F), F);
         if (opt.minimum_frequency)
-            zero_cols(0, py_slice_index(static_cast<int>(std::nearbyint(hz_to_midi(*opt.minimum_frequency) - kMidiOffset)), F));
+            zero_cols(0, py_slice_index(frequency_column(*opt.minimum_frequency), F));
         frames = frames_c.data();
         onsets = onsets_c.data();
     }
