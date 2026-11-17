@@ -1,51 +1,22 @@
-# redundant files
-.vscode/
-.pytest_cache/
-*/__pycache__/
-*/.pytest_cache/
-
-# bin folder
+# build trees
+build*/
 bin/
-
-# lib folder
 lib/
 
-# build folder
-build/
+# python
+.venv*/
+__pycache__/
+.pytest_cache/
 
-# external libraries
-src/ext/eigen-3.3.7/
-src/ext/fftw-3.3.10/
+# generated verification data (reproduce with tools/golden.py and tools/make_corpus.py)
+golden/
+out/
+data/corpus/
+data/formats/
 
-# Prerequisites
-*.d
+# editors
+.vscode/
+.idea/
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
+# local trash bin
+.trash/
