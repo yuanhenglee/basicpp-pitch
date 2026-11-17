@@ -86,8 +86,11 @@ Status:
   library's `sin`/`cos`/`exp`; the golden output comes from Windows (Universal CRT) and WebAssembly
   uses musl. Note times, pitches, pitch bends and MIDI bytes stay identical, amplitudes differ by
   ~1e-5. Linux builds (glibc) are in the same position.
-* Speed is about real time on one thread: WebAssembly uses the scalar reference kernels. SIMD128
-  kernels are the next step.
+* Speed (160 s song, Core Ultra 5 135U, Node.js 22): 4x real time on one thread, 10x on 4 threads,
+  13x on 8 (`-DBPP_WASM_THREADS=ON`). SIMD128 has no deterministic fused multiply-add, so the
+  kernels run each FMA chain in f64x2: the product of two floats is exact in double, and rounding
+  the double sum to float gives the fused result except when it lands exactly halfway between two
+  floats, which is detected and recomputed with scalar FMAs (`fma_f64x2` in `src/simd.h`).
 
 ## Usage
 

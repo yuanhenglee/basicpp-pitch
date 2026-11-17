@@ -10,6 +10,7 @@
 
 #include <array>
 #include <functional>
+#include <vector>
 
 namespace bpp::detail {
 
@@ -51,8 +52,12 @@ private:
     struct CqtGroup {
         int k0 = 0, k1 = 0;
         FloatBuffer w;
+        std::vector<double> w64;  // w in double for the SIMD128 kernels (fma_f64x2); empty otherwise
     };
     std::array<CqtGroup, 5> cqt_groups_;
+
+    // Weights in double for the SIMD128 kernels; empty in other builds.
+    std::vector<double> contour1_w64_, note1_w64_, onset1_w64_, lowpass_w64_;
 
     float bn_cqt_scale_ = 0;                     // gamma / sqrt(var + eps)
     std::array<float, 8> c1_inv_std_{};          // 1 / sqrt(var + eps)

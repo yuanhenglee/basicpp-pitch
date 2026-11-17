@@ -91,9 +91,30 @@ inline void run_rows(const RowRunner* runner, int b, int e, const std::function<
 // conv2d_1 (oneDNN brgconv, 3x39, 8 -> 8). oneDNN keeps one partial sum per kernel column:
 // part[kw] = FMA chain from 0 over (kh, ic); out = ((part[0] + part[1]) + ...) + bias.
 // Then batch norm (bnorm_tbb_jit) and ReLU. Lanes = output channels, 12 pixels per block.
-void conv_contour1(const float* hs, const float* inv_std, int t0, int t1, float* c1) {
+
+// part[kw] of pixel (t, f) for the 8 output channels, with scalar fused FMAs.
+[[maybe_unused]] void contour1_part(const float* hs, int t, int f, int kw, float* part) {
+    for (int c = 0; c < 8; ++c) part[c] = 0.0f;
+    for (int kh = 0; kh < 3; ++kh) {
+        const float* a = hs + (t + kh - 1) * kHsRow + (f + kw) * 8;  // logical column f + kw - 19
+        const float* wk = data::kConvContour1_w + (kh * 39 + kw) * 64;
+        for (int ic = 0; ic < 8; ++ic)
+            for (int c = 0; c < 8; ++c) part[c] = fmadd(a[ic], wk[8 * ic + c], part[c]);
+    }
+}
+
+[[maybe_unused]] void contour1_store(const float* total, const float* inv_std, int t, int f, float* c1) {
+    using namespace data;
+    for (int c = 0; c < 8; ++c) {
+        const float v = ((total[c] + kConvContour1_b[c]) - kBnContour_mean[c]) * inv_std[c];
+        c1[c * kC1Ch + t * kC1Row + kC1Pad + f] = relu(fmadd(v, kBnContour_gamma[c], kBnContour_beta[c]));
+    }
+}
+
+void conv_contour1(const float* hs, const float* inv_std, const double* w64, int t0, int t1, float* c1) {
     using namespace data;
 #if BPP_AVX2
+    (void)w64;
     const __m256 vb = _mm256_loadu_ps(kConvContour1_b), vm = _mm256_loadu_ps(kBnContour_mean);
     const __m256 vi = _mm256_loadu_ps(inv_std), vg = _mm256_loadu_ps(kBnContour_gamma);
     const __m256 vbeta = _mm256_loadu_ps(kBnContour_beta), zero = _mm256_setzero_ps();
@@ -128,25 +149,59 @@ void conv_contour1(const float* hs, const float* inv_std, int t0, int t1, float*
             }
         }
     }
+#elif BPP_SIMD128
+    constexpr int P = 3;  // pixels per block: 12 f64x2 accumulators
+    for (int t = t0; t < t1; ++t) {
+        for (int f0 = 0; f0 < kContourBins; f0 += P) {
+            v128_t total[P][2];
+            for (auto& a : total) a[0] = a[1] = wasm_f32x4_splat(0.0f);
+            for (int kw = 0; kw < 39; ++kw) {
+                v128_t part[P][4], flags = wasm_i64x2_splat(0);
+                for (auto& a : part)
+                    for (auto& v : a) v = wasm_f64x2_splat(0.0);
+                for (int kh = 0; kh < 3; ++kh) {
+                    const float* a = hs + (t + kh - 1) * kHsRow + (f0 + kw) * 8;
+                    const double* wk = w64 + (kh * 39 + kw) * 64;
+                    for (int ic = 0; ic < 8; ++ic) {
+                        v128_t wv[4];
+                        for (int j = 0; j < 4; ++j) wv[j] = wasm_v128_load(wk + 8 * ic + 2 * j);
+                        for (int i = 0; i < P; ++i) {
+                            const v128_t x = wasm_f64x2_splat(a[8 * i + ic]);
+                            for (int j = 0; j < 4; ++j) part[i][j] = fma_f64x2(x, wv[j], part[i][j], flags);
+                        }
+                    }
+                }
+                const bool redo = wasm_v128_any_true(flags);  // rare: redo with scalar fused FMAs
+                for (int i = 0; i < P; ++i) {
+                    v128_t lo = f64x2_pair_f32x4(part[i][0], part[i][1]), hi = f64x2_pair_f32x4(part[i][2], part[i][3]);
+                    if (redo) {
+                        alignas(16) float p8[8];
+                        contour1_part(hs, t, f0 + i, kw, p8);
+                        lo = wasm_v128_load(p8);
+                        hi = wasm_v128_load(p8 + 4);
+                    }
+                    total[i][0] = wasm_f32x4_add(total[i][0], lo);
+                    total[i][1] = wasm_f32x4_add(total[i][1], hi);
+                }
+            }
+            for (int i = 0; i < P; ++i) {
+                alignas(16) float y[8];
+                wasm_v128_store(y, total[i][0]);
+                wasm_v128_store(y + 4, total[i][1]);
+                contour1_store(y, inv_std, t, f0 + i, c1);
+            }
+        }
+    }
 #else
+    (void)w64;
     for (int t = t0; t < t1; ++t)
         for (int f = 0; f < kContourBins; ++f) {
-            float total[8] = {};
+            float total[8] = {}, part[8];
             for (int kw = 0; kw < 39; ++kw) {
-                float part[8] = {};
-                for (int kh = 0; kh < 3; ++kh) {
-                    const float* a = hs + (t + kh - 1) * kHsRow + (f + kw) * 8;
-                    const float* wk = kConvContour1_w + (kh * 39 + kw) * 64;
-                    for (int ic = 0; ic < 8; ++ic)
-                        for (int c = 0; c < 8; ++c) part[c] = fmadd(a[ic], wk[8 * ic + c], part[c]);
-                }
+                contour1_part(hs, t, f, kw, part);
                 for (int c = 0; c < 8; ++c) total[c] += part[c];
             }
-            for (int c = 0; c < 8; ++c) {
-                const float v = ((total[c] + kConvContour1_b[c]) - kBnContour_mean[c]) * inv_std[c];
-                c1[c * kC1Ch + t * kC1Row + kC1Pad + f] =
-                    std::max(fmadd(v, kBnContour_gamma[c], kBnContour_beta[c]), 0.0f);
-            }
+            contour1_store(total, inv_std, t, f, c1);
         }
 #endif
 }
@@ -155,22 +210,54 @@ void conv_contour1(const float* hs, const float* inv_std, int t0, int t1, float*
 //  conv2d_2 (oneDNN jit:avx2, 7x7, 1 -> 32): acc starts at the bias, ReLU post-op.
 //  conv2d_4 (oneDNN brgconv, 5x5, 8 -> 32): acc starts at 0, + bias, batch norm, ReLU.
 // Output is scattered to a channel-major tensor at out + c * out_ch + t * out_row + f.
+struct Out32Conv {
+    const float* in;
+    int in_row, in_c, col_off;
+    const float* w;     // [kh][k_len][32]
+    const double* w64;  // w in double (SIMD128 builds)
+    int kh, k_len, row_off;
+    const float* bias;
+    const float* inv_std;
+    float* out;
+    int out_ch, out_row;
+};
+
+template <bool kBiasFirst>
+void out32_acc(const Out32Conv& p, int t, int f, float* acc) {
+    for (int c = 0; c < 32; ++c) acc[c] = kBiasFirst ? p.bias[c] : 0.0f;
+    for (int kt = 0; kt < p.kh; ++kt) {
+        const float* a = p.in + (t + kt + p.row_off) * p.in_row + (3 * f + p.col_off) * p.in_c;
+        const float* wk = p.w + kt * p.k_len * 32;
+        for (int k = 0; k < p.k_len; ++k)
+            for (int c = 0; c < 32; ++c) acc[c] = fmadd(a[k], wk[32 * k + c], acc[c]);
+    }
+}
+
 template <bool kBiasFirst, bool kBatchNorm>
-void conv_out32_s3(const float* in, int in_row, int in_c, int col_off, const float* w, int kh, int k_len,
-                   int row_off, int t0, int t1, const float* bias, const float* inv_std, float* out, int out_ch,
-                   int out_row) {
+void out32_store(const Out32Conv& p, const float* acc, int t, int f) {
+    using namespace data;
+    for (int c = 0; c < 32; ++c) {
+        float v = acc[c];
+        if (!kBiasFirst) v += p.bias[c];
+        if (kBatchNorm) v = fmadd((v - kBnOnset_mean[c]) * p.inv_std[c], kBnOnset_gamma[c], kBnOnset_beta[c]);
+        p.out[c * p.out_ch + t * p.out_row + f] = relu(v);
+    }
+}
+
+template <bool kBiasFirst, bool kBatchNorm>
+void conv_out32_s3(const Out32Conv& p, int t0, int t1) {
     using namespace data;
 #if BPP_AVX2
     const __m256 zero = _mm256_setzero_ps();
     for (int t = t0; t < t1; ++t) {
         for (int f0 = 0; f0 < kNoteBins; f0 += 2) {
             __m256 acc[2][4];
-            for (int j = 0; j < 4; ++j) acc[0][j] = acc[1][j] = kBiasFirst ? _mm256_loadu_ps(bias + 8 * j) : zero;
-            for (int kt = 0; kt < kh; ++kt) {
-                const float* a0 = in + (t + kt + row_off) * in_row + (3 * f0 + col_off) * in_c;
-                const float* a1 = a0 + 3 * in_c;
-                const float* wk = w + kt * k_len * 32;
-                for (int k = 0; k < k_len; ++k) {
+            for (int j = 0; j < 4; ++j) acc[0][j] = acc[1][j] = kBiasFirst ? _mm256_loadu_ps(p.bias + 8 * j) : zero;
+            for (int kt = 0; kt < p.kh; ++kt) {
+                const float* a0 = p.in + (t + kt + p.row_off) * p.in_row + (3 * f0 + p.col_off) * p.in_c;
+                const float* a1 = a0 + 3 * p.in_c;
+                const float* wk = p.w + kt * p.k_len * 32;
+                for (int k = 0; k < p.k_len; ++k) {
                     const __m256 w0 = _mm256_loadu_ps(wk + 32 * k), w1 = _mm256_loadu_ps(wk + 32 * k + 8);
                     const __m256 w2 = _mm256_loadu_ps(wk + 32 * k + 16), w3 = _mm256_loadu_ps(wk + 32 * k + 24);
                     const __m256 b0 = _mm256_broadcast_ss(a0 + k), b1 = _mm256_broadcast_ss(a1 + k);
@@ -188,38 +275,50 @@ void conv_out32_s3(const float* in, int in_row, int in_c, int col_off, const flo
             for (int i = 0; i < 2; ++i)
                 for (int j = 0; j < 4; ++j) {
                     __m256 v = acc[i][j];
-                    if (!kBiasFirst) v = _mm256_add_ps(v, _mm256_loadu_ps(bias + 8 * j));
+                    if (!kBiasFirst) v = _mm256_add_ps(v, _mm256_loadu_ps(p.bias + 8 * j));
                     if (kBatchNorm) {
                         v = _mm256_mul_ps(_mm256_sub_ps(v, _mm256_loadu_ps(kBnOnset_mean + 8 * j)),
-                                          _mm256_loadu_ps(inv_std + 8 * j));
+                                          _mm256_loadu_ps(p.inv_std + 8 * j));
                         v = _mm256_fmadd_ps(v, _mm256_loadu_ps(kBnOnset_gamma + 8 * j), _mm256_loadu_ps(kBnOnset_beta + 8 * j));
                     }
                     _mm256_store_ps(y[i] + 8 * j, _mm256_max_ps(v, zero));
                 }
             for (int c = 0; c < 32; ++c) {
-                float* dst = out + c * out_ch + t * out_row + f0;
+                float* dst = p.out + c * p.out_ch + t * p.out_row + f0;
                 dst[0] = y[0][c];
                 dst[1] = y[1][c];
             }
+        }
+    }
+#elif BPP_SIMD128
+    for (int t = t0; t < t1; ++t) {
+        for (int f = 0; f < kNoteBins; ++f) {  // one pixel: 32 channels in 16 f64x2 accumulators
+            v128_t acc[16], flags = wasm_i64x2_splat(0);
+            for (int j = 0; j < 16; ++j)
+                acc[j] = kBiasFirst ? f32x4_lo_f64x2(wasm_v128_load64_zero(p.bias + 2 * j)) : wasm_f64x2_splat(0.0);
+            for (int kt = 0; kt < p.kh; ++kt) {
+                const float* a = p.in + (t + kt + p.row_off) * p.in_row + (3 * f + p.col_off) * p.in_c;
+                const double* wk = p.w64 + kt * p.k_len * 32;
+                for (int k = 0; k < p.k_len; ++k) {
+                    const v128_t x = wasm_f64x2_splat(a[k]);
+                    for (int j = 0; j < 16; ++j) acc[j] = fma_f64x2(x, wasm_v128_load(wk + 32 * k + 2 * j), acc[j], flags);
+                }
+            }
+            alignas(16) float y[32];
+            if (wasm_v128_any_true(flags)) {  // rare: redo with scalar fused FMAs
+                out32_acc<kBiasFirst>(p, t, f, y);
+            } else {
+                for (int j = 0; j < 16; j += 2) wasm_v128_store(y + 2 * j, f64x2_pair_f32x4(acc[j], acc[j + 1]));
+            }
+            out32_store<kBiasFirst, kBatchNorm>(p, y, t, f);
         }
     }
 #else
     for (int t = t0; t < t1; ++t)
         for (int f = 0; f < kNoteBins; ++f) {
             float acc[32];
-            for (int c = 0; c < 32; ++c) acc[c] = kBiasFirst ? bias[c] : 0.0f;
-            for (int kt = 0; kt < kh; ++kt) {
-                const float* a = in + (t + kt + row_off) * in_row + (3 * f + col_off) * in_c;
-                const float* wk = w + kt * k_len * 32;
-                for (int k = 0; k < k_len; ++k)
-                    for (int c = 0; c < 32; ++c) acc[c] = fmadd(a[k], wk[32 * k + c], acc[c]);
-            }
-            for (int c = 0; c < 32; ++c) {
-                float v = acc[c];
-                if (!kBiasFirst) v += bias[c];
-                if (kBatchNorm) v = fmadd((v - kBnOnset_mean[c]) * inv_std[c], kBnOnset_gamma[c], kBnOnset_beta[c]);
-                out[c * out_ch + t * out_row + f] = std::max(v, 0.0f);
-            }
+            out32_acc<kBiasFirst>(p, t, f, acc);
+            out32_store<kBiasFirst, kBatchNorm>(p, acc, t, f);
         }
 #endif
 }
@@ -233,6 +332,16 @@ struct Out1Conv {
     const float* w;  // HWIO [kh][kw][n_in]
     float bias;
 };
+
+[[maybe_unused]] float out1_acc(const Out1Conv& p, int t, int f) {
+    float acc = 0.0f;
+    for (int i = 0; i < p.kh; ++i)
+        for (int j = 0; j < p.kw; ++j)
+            for (int c = 0; c < p.n_in; ++c)
+                acc = fmadd(p.in[c * p.ch + (t + i + p.row_off) * p.row + f + j + p.col_off],
+                            p.w[(i * p.kw + j) * p.n_in + c], acc);
+    return acc;
+}
 
 template <int NV>
 void out1_block(const Out1Conv& p, int t, int f0, float* out, int out_pix) {
@@ -260,16 +369,45 @@ void out1_block(const Out1Conv& p, int t, int f0, float* out, int out_pix) {
             for (int l = 0; l < 8; ++l) out[(f0 + 8 * v + l) * out_pix] = tmp[l];
         }
     }
-#else
-    for (int l = 0; l < 8 * NV; ++l) {
-        float acc = 0.0f;
+#elif BPP_SIMD128
+    const v128_t vb = wasm_f32x4_splat(p.bias);
+    for (int v = 0; v < NV; ++v) {  // 8 pixels at a time: 4 f64x2 accumulators
+        const int fb = f0 + 8 * v;
+        v128_t acc[4], flags = wasm_i64x2_splat(0);
+        for (auto& a : acc) a = wasm_f64x2_splat(0.0);
         for (int i = 0; i < p.kh; ++i)
-            for (int j = 0; j < p.kw; ++j)
-                for (int c = 0; c < p.n_in; ++c)
-                    acc = fmadd(p.in[c * p.ch + (t + i + p.row_off) * p.row + f0 + l + j + p.col_off],
-                                   p.w[(i * p.kw + j) * p.n_in + c], acc);
-        out[(f0 + l) * out_pix] = eigen::logistic(acc + p.bias);
+            for (int j = 0; j < p.kw; ++j) {
+                const float* src = p.in + (t + i + p.row_off) * p.row + fb + j + p.col_off;
+                const float* wk = p.w + (i * p.kw + j) * p.n_in;
+                for (int c = 0; c < p.n_in; ++c) {
+                    const v128_t wv = wasm_f64x2_splat(wk[c]);
+                    const v128_t x0 = wasm_v128_load(src + c * p.ch), x1 = wasm_v128_load(src + c * p.ch + 4);
+                    acc[0] = fma_f64x2(f32x4_lo_f64x2(x0), wv, acc[0], flags);
+                    acc[1] = fma_f64x2(f32x4_hi_f64x2(x0), wv, acc[1], flags);
+                    acc[2] = fma_f64x2(f32x4_lo_f64x2(x1), wv, acc[2], flags);
+                    acc[3] = fma_f64x2(f32x4_hi_f64x2(x1), wv, acc[3], flags);
+                }
+            }
+        alignas(16) float y[8];
+        if (wasm_v128_any_true(flags)) {  // rare: redo with scalar fused FMAs
+            for (int l = 0; l < 8; ++l) y[l] = out1_acc(p, t, fb + l);
+        } else {
+            wasm_v128_store(y, f64x2_pair_f32x4(acc[0], acc[1]));
+            wasm_v128_store(y + 4, f64x2_pair_f32x4(acc[2], acc[3]));
+        }
+        for (int h = 0; h < 2; ++h) {
+            const v128_t r = eigen::logistic_ps4(wasm_f32x4_add(wasm_v128_load(y + 4 * h), vb));
+            if (out_pix == 1) {
+                wasm_v128_store(out + fb + 4 * h, r);
+            } else {
+                alignas(16) float tmp[4];
+                wasm_v128_store(tmp, r);
+                for (int l = 0; l < 4; ++l) out[(fb + 4 * h + l) * out_pix] = tmp[l];
+            }
+        }
     }
+#else
+    for (int l = 0; l < 8 * NV; ++l) out[(f0 + l) * out_pix] = eigen::logistic(out1_acc(p, t, f0 + l) + p.bias);
 #endif
 }
 
@@ -335,6 +473,13 @@ WindowModel::WindowModel() {
                 grp.w[(k - k0) * 16 + 8 + l] = kCqtKernelImag[b * kCqtKernelLen + k];
             }
     }
+#if BPP_SIMD128
+    for (CqtGroup& grp : cqt_groups_) grp.w64.assign(grp.w.data(), grp.w.data() + std::max(0, grp.k1 - grp.k0) * 16);
+    contour1_w64_.assign(kConvContour1_w, kConvContour1_w + 3 * 39 * 64);
+    note1_w64_.assign(kConvNote1_w, kConvNote1_w + 7 * 7 * 32);
+    onset1_w64_.assign(kConvOnset1_w, kConvOnset1_w + 5 * 5 * 8 * 32);
+    lowpass_w64_.assign(kLowpass, kLowpass + kLowpassLen);
+#endif
     // oneDNN nspc_bnorm (1 channel): (x - mean) * (gamma / sqrt(var + eps)) + beta
     bn_cqt_scale_ = kBnCqt_gamma[0] / std::sqrt(kBnCqt_var[0] + kBnEps);
     // oneDNN bnorm_tbb_jit: fma((x - mean) * (1 / sqrt(var + eps)), gamma, beta)
@@ -346,7 +491,16 @@ namespace {
 
 // Low-pass + decimate by 2 (nnAudio downsampling_by_n, zero padding of 127 on each side).
 // oneDNN jit:avx2 conv: acc = 0, then taps 0..255 in order.
-int decimate(const float* x, int n, Workspace& ws) {
+[[maybe_unused]] float decimate_one(const float* e, const float* o, const float* h, int j) {
+    float acc = 0;
+    for (int i = 0; i < kLowpassLen / 2; ++i) {
+        acc = fmadd(e[j + i], h[2 * i], acc);
+        acc = fmadd(o[j + i], h[2 * i + 1], acc);
+    }
+    return acc;
+}
+
+int decimate(const float* x, int n, Workspace& ws, const double* h64) {
     const int n_out = decimated_length(n);
     const int n_out_pad = (n_out + 31) / 32 * 32;
     const int m_needed = n_out_pad + kLowpassLen / 2;
@@ -360,6 +514,7 @@ int decimate(const float* x, int n, Workspace& ws) {
     const float* h = data::kLowpass;
     float* out = ws.down.data();
 #if BPP_AVX2
+    (void)h64;
     for (int j = 0; j < n_out_pad; j += 32) {
         __m256 acc0 = _mm256_setzero_ps(), acc1 = acc0, acc2 = acc0, acc3 = acc0;
         for (int i = 0; i < kLowpassLen / 2; ++i) {
@@ -380,15 +535,33 @@ int decimate(const float* x, int n, Workspace& ws) {
         _mm256_storeu_ps(out + j + 16, acc2);
         _mm256_storeu_ps(out + j + 24, acc3);
     }
-#else
-    for (int j = 0; j < n_out; ++j) {
-        float acc = 0;
+#elif BPP_SIMD128
+    for (int j = 0; j < n_out; j += 8) {  // 8 outputs: 4 f64x2 accumulators
+        v128_t acc[4], flags = wasm_i64x2_splat(0);
+        for (auto& a : acc) a = wasm_f64x2_splat(0.0);
         for (int i = 0; i < kLowpassLen / 2; ++i) {
-            acc = fmadd(e[j + i], h[2 * i], acc);
-            acc = fmadd(o[j + i], h[2 * i + 1], acc);
+            const v128_t he = wasm_v128_load64_splat(h64 + 2 * i), ho = wasm_v128_load64_splat(h64 + 2 * i + 1);
+            const v128_t e0 = wasm_v128_load(e + j + i), e1 = wasm_v128_load(e + j + i + 4);
+            const v128_t o0 = wasm_v128_load(o + j + i), o1 = wasm_v128_load(o + j + i + 4);
+            acc[0] = fma_f64x2(f32x4_lo_f64x2(e0), he, acc[0], flags);
+            acc[1] = fma_f64x2(f32x4_hi_f64x2(e0), he, acc[1], flags);
+            acc[2] = fma_f64x2(f32x4_lo_f64x2(e1), he, acc[2], flags);
+            acc[3] = fma_f64x2(f32x4_hi_f64x2(e1), he, acc[3], flags);
+            acc[0] = fma_f64x2(f32x4_lo_f64x2(o0), ho, acc[0], flags);
+            acc[1] = fma_f64x2(f32x4_hi_f64x2(o0), ho, acc[1], flags);
+            acc[2] = fma_f64x2(f32x4_lo_f64x2(o1), ho, acc[2], flags);
+            acc[3] = fma_f64x2(f32x4_hi_f64x2(o1), ho, acc[3], flags);
         }
-        out[j] = acc;
+        if (wasm_v128_any_true(flags)) {  // rare: redo with scalar fused FMAs
+            for (int l = 0; l < 8; ++l) out[j + l] = decimate_one(e, o, h, j + l);
+        } else {
+            wasm_v128_store(out + j, f64x2_pair_f32x4(acc[0], acc[1]));
+            wasm_v128_store(out + j + 4, f64x2_pair_f32x4(acc[2], acc[3]));
+        }
     }
+#else
+    (void)h64;
+    for (int j = 0; j < n_out; ++j) out[j] = decimate_one(e, o, h, j);
 #endif
     return n_out;
 }
@@ -400,9 +573,25 @@ void reflect_pad(const float* x, int n, float* r) {
 }
 
 // CQT conv1d (oneDNN brgconv / jit:avx2 with a single input channel): acc = 0, taps in order.
+// One frame (row) of 8 bins with scalar fused FMAs.
+[[maybe_unused]] void cqt_row(const float* sig, int hop, int row, const float* w, int k0, int k1, float* re, float* im) {
+    for (int l = 0; l < 8; ++l) {
+        float sr = 0, si = 0;
+        for (int k = k0; k < k1; ++k) {
+            const float a = sig[row * hop + k];
+            sr = fmadd(a, w[(k - k0) * 16 + l], sr);
+            si = fmadd(a, w[(k - k0) * 16 + 8 + l], si);
+        }
+        re[l] = sr;
+        im[l] = si;
+    }
+}
+
 template <int MR>
-void cqt_block(const float* sig, int hop, int f0, const float* w, int k0, int k1, float* re, float* im) {
+void cqt_block(const float* sig, int hop, int f0, const float* w, const double* w64, int k0, int k1, float* re,
+               float* im) {
 #if BPP_AVX2
+    (void)w64;
     __m256 ar[MR], ai[MR];
     for (int r = 0; r < MR; ++r) ar[r] = ai[r] = _mm256_setzero_ps();
     for (int k = k0; k < k1; ++k) {
@@ -417,18 +606,44 @@ void cqt_block(const float* sig, int hop, int f0, const float* w, int k0, int k1
         _mm256_storeu_ps(re + 8 * r, ar[r]);
         _mm256_storeu_ps(im + 8 * r, ai[r]);
     }
-#else
-    for (int r = 0; r < MR; ++r)
-        for (int l = 0; l < 8; ++l) {
-            float sr = 0, si = 0;
-            for (int k = k0; k < k1; ++k) {
-                const float a = sig[(f0 + r) * hop + k];
-                sr = fmadd(a, w[(k - k0) * 16 + l], sr);
-                si = fmadd(a, w[(k - k0) * 16 + 8 + l], si);
+#elif BPP_SIMD128
+    static_assert(MR % 2 == 0, "rows are processed in pairs");
+    for (int r0 = 0; r0 < MR; r0 += 2) {  // 2 rows x 8 bins x (re, im): 16 f64x2 accumulators
+        v128_t ar[2][4], ai[2][4], flags = wasm_i64x2_splat(0);
+        for (int r = 0; r < 2; ++r)
+            for (int q = 0; q < 4; ++q) ar[r][q] = ai[r][q] = wasm_f64x2_splat(0.0);
+        for (int k = k0; k < k1; ++k) {
+            const double* wk = w64 + (k - k0) * 16;
+            v128_t wr[4], wi[4];
+            for (int q = 0; q < 4; ++q) {
+                wr[q] = wasm_v128_load(wk + 2 * q);
+                wi[q] = wasm_v128_load(wk + 8 + 2 * q);
             }
-            re[8 * r + l] = sr;
-            im[8 * r + l] = si;
+            for (int r = 0; r < 2; ++r) {
+                const v128_t a = wasm_f64x2_splat(sig[(f0 + r0 + r) * hop + k]);
+                for (int q = 0; q < 4; ++q) {
+                    ar[r][q] = fma_f64x2(a, wr[q], ar[r][q], flags);
+                    ai[r][q] = fma_f64x2(a, wi[q], ai[r][q], flags);
+                }
+            }
         }
+        const bool redo = wasm_v128_any_true(flags);  // rare: redo with scalar fused FMAs
+        for (int r = 0; r < 2; ++r) {
+            float* pr = re + 8 * (r0 + r);
+            float* pi = im + 8 * (r0 + r);
+            if (redo) {
+                cqt_row(sig, hop, f0 + r0 + r, w, k0, k1, pr, pi);
+                continue;
+            }
+            wasm_v128_store(pr, f64x2_pair_f32x4(ar[r][0], ar[r][1]));
+            wasm_v128_store(pr + 4, f64x2_pair_f32x4(ar[r][2], ar[r][3]));
+            wasm_v128_store(pi, f64x2_pair_f32x4(ai[r][0], ai[r][1]));
+            wasm_v128_store(pi + 4, f64x2_pair_f32x4(ai[r][2], ai[r][3]));
+        }
+    }
+#else
+    (void)w64;
+    for (int r = 0; r < MR; ++r) cqt_row(sig, hop, f0 + r, w, k0, k1, re + 8 * r, im + 8 * r);
 #endif
 }
 
@@ -449,8 +664,8 @@ void WindowModel::cqt(const float* window, Workspace& ws) const {
             alignas(32) float re[6 * 8], im[6 * 8];
             for (int f0 = 0; f0 < kFramesPerWindow;) {
                 const int mr = kFramesPerWindow - f0 >= 6 ? 6 : 4;
-                if (mr == 6) cqt_block<6>(sig, hop, f0, grp.w.data(), grp.k0, grp.k1, re, im);
-                else cqt_block<4>(sig, hop, f0, grp.w.data(), grp.k0, grp.k1, re, im);
+                if (mr == 6) cqt_block<6>(sig, hop, f0, grp.w.data(), grp.w64.data(), grp.k0, grp.k1, re, im);
+                else cqt_block<4>(sig, hop, f0, grp.w.data(), grp.w64.data(), grp.k0, grp.k1, re, im);
                 for (int r = 0; r < mr; ++r)
                     for (int b = b_lo; b < b_hi; ++b) {
                         const int gb = bin0 + b;
@@ -462,7 +677,7 @@ void WindowModel::cqt(const float* window, Workspace& ws) const {
             }
         }
         if (oct + 1 < kOctaves) {
-            n = decimate(sig + kReflectPad, n, ws);
+            n = decimate(sig + kReflectPad, n, ws, lowpass_w64_.data());
             x = ws.down.data();
         }
     }
@@ -488,6 +703,19 @@ void WindowModel::normalize_and_stack(Workspace& ws) const {
         const __m256 mag = _mm256_sqrt_ps(_mm256_add_ps(_mm256_mul_ps(r, r), _mm256_mul_ps(q, q)));
         const __m256 pw = _mm256_add_ps(_mm256_mul_ps(mag, mag), eps);
         _mm256_storeu_ps(lp + i, _mm256_mul_ps(eigen::log_ps(pw), db));
+    }
+#elif BPP_SIMD128
+    const v128_t eps = wasm_f32x4_splat(1e-10f), db = wasm_f32x4_splat(kDbPerNeper);
+    for (; i < total - total % 8; i += 4) {
+        const int b = i % kCqtBins;
+        alignas(16) float sl[4];
+        for (int l = 0; l < 4; ++l) sl[l] = data::kCqtSqrtLengths[(b + l) % kCqtBins];
+        const v128_t s = wasm_v128_load(sl);
+        const v128_t r = wasm_f32x4_mul(wasm_v128_load(re + i), s);
+        const v128_t q = wasm_f32x4_mul(wasm_v128_load(im + i), s);
+        const v128_t mag = wasm_f32x4_sqrt(wasm_f32x4_add(wasm_f32x4_mul(r, r), wasm_f32x4_mul(q, q)));
+        const v128_t pw = wasm_f32x4_add(wasm_f32x4_mul(mag, mag), eps);
+        wasm_v128_store(lp + i, wasm_f32x4_mul(eigen::log_ps4(pw), db));
     }
 #else
     for (; i < total - total % 8; ++i) {
@@ -545,7 +773,9 @@ void WindowModel::run(const float* window, Workspace& ws, float* contour, float*
         // conv2d_1 (3x39, 8 -> 8) + BN + ReLU
         BPP_STAGE(2);
         run_rows(runner, kC1Begin, kC1End,
-                 [&](int b, int e) { conv_contour1(ws.hs.data(), c1_inv_std_.data(), b, e, ws.c1.data()); });
+                 [&](int b, int e) {
+                     conv_contour1(ws.hs.data(), c1_inv_std_.data(), contour1_w64_.data(), b, e, ws.c1.data());
+                 });
     }
     {
         // contours-reduced (5x5, 8 -> 1) + sigmoid -> Yp
@@ -557,14 +787,14 @@ void WindowModel::run(const float* window, Workspace& ws, float* contour, float*
     {
         // conv2d_2 (7x7 /3, 1 -> 32) + ReLU, and conv2d_4 (5x5 /3, 8 -> 32) + BN + ReLU
         BPP_STAGE(4);
+        const Out32Conv note1{ws.yp.data(), kYpRow, 1, kYpPad - 2, kConvNote1_w, note1_w64_.data(), 7, 7, -3,
+                              kConvNote1_b, nullptr, ws.n1.data() + kN1Pad, kN1Ch, kN1Row};
+        const Out32Conv onset1{ws.hs.data(), kHsRow, 8, kHsPad - 1, kConvOnset1_w, onset1_w64_.data(), 5, 5 * 8, -2,
+                               kConvOnset1_b, o1_inv_std_.data(), ws.cat.data() + kCatCh + kCatPad, kCatCh, kCatRow};
         run_rows(runner, kN1Begin, kN1End, [&](int b, int e) {
-            conv_out32_s3<true, false>(ws.yp.data(), kYpRow, 1, kYpPad - 2, kConvNote1_w, 7, 7, -3, b, e, kConvNote1_b,
-                                       nullptr, ws.n1.data() + kN1Pad, kN1Ch, kN1Row);
+            conv_out32_s3<true, false>(note1, b, e);
             const int ob = std::max(b, kCatBegin), oe = std::min(e, kCatEnd);
-            if (ob < oe)
-                conv_out32_s3<false, true>(ws.hs.data(), kHsRow, 8, kHsPad - 1, kConvOnset1_w, 5, 5 * 8, -2, ob, oe,
-                                           kConvOnset1_b, o1_inv_std_.data(), ws.cat.data() + kCatCh + kCatPad, kCatCh,
-                                           kCatRow);
+            if (ob < oe) conv_out32_s3<false, true>(onset1, ob, oe);
         });
     }
     {

@@ -22,6 +22,14 @@
 #define BPP_AVX2 0
 #endif
 
+// WebAssembly SIMD128 kernels (when there is no AVX2).
+#if !BPP_AVX2 && defined(__wasm_simd128__)
+#define BPP_SIMD128 1
+#include <wasm_simd128.h>
+#else
+#define BPP_SIMD128 0
+#endif
+
 namespace bpp::detail {
 
 // x * y + z with one rounding, like std::fma. Without hardware FMA (WebAssembly, x86-64 below v3)
@@ -39,6 +47,39 @@ inline float fmadd(float x, float y, float z) {
     return std::fma(x, y, z);
 #endif
 }
+
+#if BPP_SIMD128
+
+// Fused float FMA chains on WebAssembly SIMD128, which has no deterministic fused multiply-add.
+// Accumulators are f64x2 vectors holding float values exactly. A step computes x * w + acc in
+// double, where the product of two floats is exact, and rounds that once more to float: this is
+// the fused result unless the double sum lies exactly halfway between two floats (the case
+// musl's fmaf handles separately). Such sums set bits in `flags`; the caller then recomputes the
+// block with the scalar fmadd().
+inline v128_t fma_f64x2(v128_t x, v128_t w, v128_t acc, v128_t& flags) {
+    const v128_t r = wasm_f64x2_add(wasm_f64x2_mul(x, w), acc);
+    const v128_t low = wasm_v128_and(r, wasm_i64x2_const_splat(0x1fffffff));
+    flags = wasm_v128_or(flags, wasm_i64x2_eq(low, wasm_i64x2_const_splat(0x10000000)));
+    v128_t f = wasm_f32x4_demote_f64x2_zero(r);
+    __asm__("" : "+r"(f));  // keeps LLVM from folding demote + promote into scalar code
+    return wasm_f64x2_promote_low_f32x4(f);
+}
+
+// Float lanes 0-1 / 2-3 of v as f64x2, and two float-exact f64x2 back as one f32x4.
+inline v128_t f32x4_lo_f64x2(v128_t v) { return wasm_f64x2_promote_low_f32x4(v); }
+inline v128_t f32x4_hi_f64x2(v128_t v) { return wasm_f64x2_promote_low_f32x4(wasm_i32x4_shuffle(v, v, 2, 3, 2, 3)); }
+inline v128_t f64x2_pair_f32x4(v128_t lo, v128_t hi) {
+    return wasm_i32x4_shuffle(wasm_f32x4_demote_f64x2_zero(lo), wasm_f32x4_demote_f64x2_zero(hi), 0, 1, 4, 5);
+}
+
+// x86 maxps / minps (second operand on ties and NaN); wasm's max / min follow IEEE instead.
+inline v128_t max_x86(v128_t a, v128_t b) { return wasm_f32x4_pmax(b, a); }
+inline v128_t min_x86(v128_t a, v128_t b) { return wasm_f32x4_pmin(b, a); }
+
+#endif
+
+// ReLU as x86's max(v, 0): +0 for -0 and NaN.
+inline float relu(float v) { return v > 0.0f ? v : 0.0f; }
 
 // 64-byte aligned, zero-initialised float buffer.
 class FloatBuffer {
@@ -205,6 +246,71 @@ inline __m256 log_ps(__m256 x) {
     q = madd(m, q, _mm256_set1_ps(1.4999999999999927f));
     q = madd(m, q, one);
     return madd(e, _mm256_set1_ps(0.693147182464599609375f), _mm256_div_ps(p, q));
+}
+
+#endif
+
+#if BPP_SIMD128
+
+// 4-lane versions of the AVX2 functions above, operation for operation.
+inline v128_t madd_ps4(v128_t a, v128_t b, v128_t c) { return wasm_f32x4_add(wasm_f32x4_mul(a, b), c); }
+
+inline v128_t ldexp_ps4(v128_t a, v128_t e_in) {
+    const v128_t maxe = wasm_f32x4_splat(277.0f);
+    const v128_t e = max_x86(min_x86(e_in, maxe), wasm_f32x4_sub(wasm_f32x4_splat(0.0f), maxe));
+    const v128_t ei = wasm_i32x4_trunc_sat_f32x4(e);
+    v128_t b = wasm_i32x4_shr(ei, 2);
+    const v128_t bias = wasm_i32x4_splat(127);
+    v128_t c = wasm_i32x4_shl(wasm_i32x4_add(b, bias), 23);
+    const v128_t out = wasm_f32x4_mul(wasm_f32x4_mul(wasm_f32x4_mul(a, c), c), c);
+    b = wasm_i32x4_sub(wasm_i32x4_sub(wasm_i32x4_sub(ei, b), b), b);
+    c = wasm_i32x4_shl(wasm_i32x4_add(b, bias), 23);
+    return wasm_f32x4_mul(out, c);
+}
+
+inline v128_t exp_ps4(v128_t x_in) {
+    const v128_t zero_mask = wasm_f32x4_lt(x_in, wasm_f32x4_splat(-104.0f));
+    const v128_t x = min_x86(x_in, wasm_f32x4_splat(88.723f));
+    const v128_t m = wasm_f32x4_floor(madd_ps4(x, wasm_f32x4_splat(1.44269504088896341f), wasm_f32x4_splat(0.5f)));
+    v128_t r = madd_ps4(m, wasm_f32x4_splat(-0.693359375f), x);
+    r = madd_ps4(m, wasm_f32x4_splat(2.12194440e-4f), r);
+    const v128_t r2 = wasm_f32x4_mul(r, r);
+    v128_t p_even = madd_ps4(r2, wasm_f32x4_splat(1.37449637986719608306884765625e-3f),
+                             wasm_f32x4_splat(4.166965186595916748046875e-2f));
+    const v128_t p_odd = madd_ps4(r2, wasm_f32x4_splat(8.36894474923610687255859375e-3f),
+                                  wasm_f32x4_splat(0.16666518151760101318359375f));
+    p_even = madd_ps4(r2, p_even, wasm_f32x4_splat(0.49999988079071044921875f));
+    const v128_t p_low = wasm_f32x4_add(r, wasm_f32x4_splat(1.0f));
+    v128_t y = madd_ps4(r, p_odd, p_even);
+    y = madd_ps4(r2, y, p_low);
+    const v128_t res = max_x86(ldexp_ps4(y, m), x_in);
+    return wasm_v128_andnot(res, zero_mask);
+}
+
+inline v128_t logistic_ps4(v128_t x) {
+    const v128_t one = wasm_f32x4_splat(1.0f);
+    const v128_t e = exp_ps4(x);
+    const v128_t inf_mask = wasm_f32x4_eq(e, wasm_f32x4_splat(std::numeric_limits<float>::infinity()));
+    return wasm_v128_bitselect(one, wasm_f32x4_div(e, wasm_f32x4_add(one, e)), inf_mask);
+}
+
+inline v128_t log_ps4(v128_t x) {
+    const v128_t one = wasm_f32x4_splat(1.0f);
+    v128_t e = wasm_f32x4_convert_i32x4(
+        wasm_i32x4_sub(wasm_v128_and(wasm_u32x4_shr(x, 23), wasm_i32x4_splat(0xff)), wasm_i32x4_splat(126)));
+    v128_t m = wasm_v128_or(wasm_v128_and(x, wasm_i32x4_splat(static_cast<int>(0x807fffffu))), wasm_i32x4_splat(0x3f000000));
+    const v128_t mask = wasm_f32x4_lt(m, wasm_f32x4_splat(0.707106781186547524f));
+    const v128_t tmp = wasm_v128_and(m, mask);
+    m = wasm_f32x4_sub(m, one);
+    e = wasm_f32x4_sub(e, wasm_v128_and(one, mask));
+    m = wasm_f32x4_add(m, tmp);
+    v128_t p = madd_ps4(m, wasm_f32x4_splat(0.18256296349849254f), wasm_f32x4_splat(1.0000000190281063f));
+    p = madd_ps4(m, p, wasm_f32x4_splat(1.0000000190281136f));
+    p = wasm_f32x4_mul(m, p);
+    v128_t q = madd_ps4(m, wasm_f32x4_splat(0.049616247954120038f), wasm_f32x4_splat(0.59923249590823520f));
+    q = madd_ps4(m, q, wasm_f32x4_splat(1.4999999999999927f));
+    q = madd_ps4(m, q, one);
+    return madd_ps4(e, wasm_f32x4_splat(0.693147182464599609375f), wasm_f32x4_div(p, q));
 }
 
 #endif
