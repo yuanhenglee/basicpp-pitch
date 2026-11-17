@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <vector>
 
 namespace bpp::detail {
@@ -21,5 +22,26 @@ void resample_to_model_rate(const float* mono, size_t n, uint32_t sample_rate, f
                             const std::function<void(size_t)>& progress);
 
 std::vector<float> resample_to_model_rate(const std::vector<float>& mono, uint32_t sample_rate);
+
+// Incremental resample_to_model_rate() for live input. The concatenated output equals the offline
+// result for the same total input, however the input is split (libsoxr's output does not depend on
+// how its input is chunked; tests/test_fixture.cpp checks this).
+class StreamResampler {
+public:
+    explicit StreamResampler(uint32_t sample_rate);
+    ~StreamResampler();
+    StreamResampler(const StreamResampler&) = delete;
+    StreamResampler& operator=(const StreamResampler&) = delete;
+
+    // Consumes mono[0, n) and appends the result samples that are now final to out.
+    void push(const float* mono, size_t n, std::vector<float>& out);
+
+    // Flushes the resampler and appends the rest of the result, zero-padded like fix_length.
+    void finish(std::vector<float>& out);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 }  // namespace bpp::detail

@@ -1,0 +1,16 @@
+{
+  "name": "basicpp-pitch",
+  "version": "2.0.0",
+  "description": "Bit-exact WebAssembly build of Spotify's basic-pitch music transcription model",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "files": ["index.js", "index.d.ts", "basicpp_pitch_wasm.mjs", "basicpp_pitch_wasm.wasm", "README.md"],
+  "engines": { "node": ">=18" },
+  "repository": "github:yuanhenglee/basicpp-pitch"
+}

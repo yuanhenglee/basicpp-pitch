@@ -138,14 +138,14 @@ void conv_contour1(const float* hs, const float* inv_std, int t0, int t1, float*
                     const float* a = hs + (t + kh - 1) * kHsRow + (f + kw) * 8;
                     const float* wk = kConvContour1_w + (kh * 39 + kw) * 64;
                     for (int ic = 0; ic < 8; ++ic)
-                        for (int c = 0; c < 8; ++c) part[c] = std::fma(a[ic], wk[8 * ic + c], part[c]);
+                        for (int c = 0; c < 8; ++c) part[c] = fmadd(a[ic], wk[8 * ic + c], part[c]);
                 }
                 for (int c = 0; c < 8; ++c) total[c] += part[c];
             }
             for (int c = 0; c < 8; ++c) {
                 const float v = ((total[c] + kConvContour1_b[c]) - kBnContour_mean[c]) * inv_std[c];
                 c1[c * kC1Ch + t * kC1Row + kC1Pad + f] =
-                    std::max(std::fma(v, kBnContour_gamma[c], kBnContour_beta[c]), 0.0f);
+                    std::max(fmadd(v, kBnContour_gamma[c], kBnContour_beta[c]), 0.0f);
             }
         }
 #endif
@@ -212,12 +212,12 @@ void conv_out32_s3(const float* in, int in_row, int in_c, int col_off, const flo
                 const float* a = in + (t + kt + row_off) * in_row + (3 * f + col_off) * in_c;
                 const float* wk = w + kt * k_len * 32;
                 for (int k = 0; k < k_len; ++k)
-                    for (int c = 0; c < 32; ++c) acc[c] = std::fma(a[k], wk[32 * k + c], acc[c]);
+                    for (int c = 0; c < 32; ++c) acc[c] = fmadd(a[k], wk[32 * k + c], acc[c]);
             }
             for (int c = 0; c < 32; ++c) {
                 float v = acc[c];
                 if (!kBiasFirst) v += bias[c];
-                if (kBatchNorm) v = std::fma((v - kBnOnset_mean[c]) * inv_std[c], kBnOnset_gamma[c], kBnOnset_beta[c]);
+                if (kBatchNorm) v = fmadd((v - kBnOnset_mean[c]) * inv_std[c], kBnOnset_gamma[c], kBnOnset_beta[c]);
                 out[c * out_ch + t * out_row + f] = std::max(v, 0.0f);
             }
         }
@@ -266,7 +266,7 @@ void out1_block(const Out1Conv& p, int t, int f0, float* out, int out_pix) {
         for (int i = 0; i < p.kh; ++i)
             for (int j = 0; j < p.kw; ++j)
                 for (int c = 0; c < p.n_in; ++c)
-                    acc = std::fma(p.in[c * p.ch + (t + i + p.row_off) * p.row + f0 + l + j + p.col_off],
+                    acc = fmadd(p.in[c * p.ch + (t + i + p.row_off) * p.row + f0 + l + j + p.col_off],
                                    p.w[(i * p.kw + j) * p.n_in + c], acc);
         out[(f0 + l) * out_pix] = eigen::logistic(acc + p.bias);
     }
@@ -384,8 +384,8 @@ int decimate(const float* x, int n, Workspace& ws) {
     for (int j = 0; j < n_out; ++j) {
         float acc = 0;
         for (int i = 0; i < kLowpassLen / 2; ++i) {
-            acc = std::fma(e[j + i], h[2 * i], acc);
-            acc = std::fma(o[j + i], h[2 * i + 1], acc);
+            acc = fmadd(e[j + i], h[2 * i], acc);
+            acc = fmadd(o[j + i], h[2 * i + 1], acc);
         }
         out[j] = acc;
     }
@@ -423,8 +423,8 @@ void cqt_block(const float* sig, int hop, int f0, const float* w, int k0, int k1
             float sr = 0, si = 0;
             for (int k = k0; k < k1; ++k) {
                 const float a = sig[(f0 + r) * hop + k];
-                sr = std::fma(a, w[(k - k0) * 16 + l], sr);
-                si = std::fma(a, w[(k - k0) * 16 + 8 + l], si);
+                sr = fmadd(a, w[(k - k0) * 16 + l], sr);
+                si = fmadd(a, w[(k - k0) * 16 + 8 + l], si);
             }
             re[8 * r + l] = sr;
             im[8 * r + l] = si;

@@ -14,7 +14,10 @@ polyphonic, instrument-agnostic music transcription model
   completes, using under 1 % of the time budget. Its output is bit-identical to offline processing.
 * **Self-contained.** No TensorFlow, Python, Eigen or MKL. The weights are compiled in, AVX2/FMA
   kernels are hand-written with a portable scalar fallback, and libsoxr is vendored for
-  librosa-identical resampling. C++17 library, CLI, C API and Python bindings.
+  librosa-identical resampling. C++17 library, CLI, C API, Python bindings and a WebAssembly build
+  for browsers and Node.js.
+* **Any input format.** PCM at any sample rate and channel count, offline or streaming, is mixed to
+  mono and resampled inside the engine exactly as `librosa.load` does.
 
 ## Results
 
@@ -61,6 +64,31 @@ cmake --build build
 Outputs: `bpp` (CLI), `libbpp` (static library), `basicpp_pitch` shared library (C API, used by the
 Python package).
 
+### WebAssembly
+
+With [Emscripten](https://emscripten.org) (tested with 7.0.0) activated:
+
+```sh
+emcmake cmake -G Ninja -S . -B build-wasm -DCMAKE_BUILD_TYPE=Release
+cmake --build build-wasm
+ctest --test-dir build-wasm        # fixture test and JavaScript API test, under Node.js
+```
+
+`build-wasm/js/` is the npm package (`js/README.md`): an ES module wrapper around
+`basicpp_pitch_wasm.{mjs,wasm}`. `build-wasm/bpp.js` is the CLI for Node.js, accepted by
+`tools/verify.py --bin`. Options: `-DBPP_WASM_SIMD=OFF` for engines without SIMD128,
+`-DBPP_WASM_THREADS=ON` for pthreads (the page must be cross-origin isolated).
+
+Status:
+
+* Model output and notes are bit-identical to basic-pitch for 22050 Hz input.
+* Resampled input matches to about one ulp, not bit for bit. libsoxr designs its filter with the C
+  library's `sin`/`cos`/`exp`; the golden output comes from Windows (Universal CRT) and WebAssembly
+  uses musl. Note times, pitches, pitch bends and MIDI bytes stay identical, amplitudes differ by
+  ~1e-5. Linux builds (glibc) are in the same position.
+* Speed is about real time on one thread: WebAssembly uses the scalar reference kernels. SIMD128
+  kernels are the next step.
+
 ## Usage
 
 ### Command line
@@ -85,11 +113,15 @@ bpp::ModelOutput out = engine.infer_file("song.wav"); // or engine.infer(samples
 std::vector<bpp::NoteEvent> notes = bpp::output_to_notes(out);
 std::vector<uint8_t> midi = bpp::notes_to_midi(notes);
 
-// live input
-bpp::Stream stream(/*threads=*/2);
-while (capturing) stream.push(chunk, n);              // 22050 Hz mono float32
+// decoded audio in any format: interleaved float32, mixed and resampled like librosa.load
+out = engine.infer_pcm(pcm, n_frames, /*sample_rate=*/48000, /*channels=*/2);
+
+// live input, e.g. 48 kHz mono from a microphone
+bpp::Stream stream(/*threads=*/2, /*sample_rate=*/48000, /*channels=*/1);
+while (capturing) stream.push(chunk, n_frames);
+auto live_notes = bpp::output_to_notes(stream.output());  // frames [0, stream.final_frames()) are final
 stream.finish();
-auto live_notes = bpp::output_to_notes(stream.output());
+auto notes_all = bpp::output_to_notes(stream.output());   // equals engine.infer_pcm() on all audio
 ```
 
 ### Python
@@ -102,10 +134,23 @@ result = bpp.predict("song.wav")            # same outputs as basic_pitch.infere
 open("song.mid", "wb").write(result.midi_bytes)
 for start_s, end_s, pitch, amplitude, bends in result.note_events:
     ...
+
+result = bpp.predict(pcm, sample_rate=44100)  # (n,) or (n, channels) array at any rate
+stream = bpp.Stream(2, sample_rate=48000)     # live input; push() float32 chunks
 ```
 
-`bpp.Engine`, `bpp.Stream`, `bpp.load_audio` and `bpp.output_to_notes` expose the same pieces as the
-C++ API. The package finds the shared library next to itself, in `build/`, or via
+`bpp.Engine` (`infer`, `infer_file`, `infer_pcm`), `bpp.Stream`, `bpp.load_audio` and
+`bpp.output_to_notes` expose the same pieces as the C++ API.
+
+### JavaScript (WebAssembly)
+
+```js
+import { loadBasicPitch } from "./build-wasm/js/index.js";
+
+const bp = await loadBasicPitch();
+const { notes, midi } = bp.transcribe(pcm, { sampleRate: 44100, channels: 2 });  // Float32Array, interleaved
+const stream = bp.createStream({ sampleRate: 48000 });                         // live input
+``` The package finds the shared library next to itself, in `build/`, or via
 `BASICPP_PITCH_LIB`.
 
 ## How it works
@@ -148,7 +193,8 @@ python tools/make_corpus.py data/corpus                    # synthetic edge case
 python tools/golden.py data/corpus/*.wav --out golden/tf   # reference outputs from basic-pitch
 python tools/verify.py                                     # C++ vs reference: every float, note and byte
 python tools/verify.py --source                            # end to end from the original WAV files
-python tools/verify.py --stream-chunk-ms 10                # streaming API
+python tools/verify.py --stream-chunk-ms 10                # streaming API (--source: resampling stream)
+python tools/verify.py --bin build-wasm/bpp.js             # WebAssembly build
 python -m pytest tests                                     # Python binding + note options vs basic-pitch
 ```
 
@@ -163,9 +209,11 @@ src/              engine: window_model (CQT + CNN), engine (windowing, threads, 
                   notes, midi, audio + resample, simd (Eigen-exact math), model_data (generated)
 apps/bpp_cli.cpp  command line tool
 python/           ctypes bindings
+js/               JavaScript wrapper and test for the WebAssembly build
 tests/            CTest fixture test, pytest suite
 tools/            weight export, golden generation, verification, debugging probes
-third_party/      libsoxr 0.1.3 (LGPL-2.1) as bundled by python-soxr 1.1; UCRT math shim
+third_party/      libsoxr 0.1.3 (LGPL-2.1) as bundled by python-soxr 1.1 (plus a two-line patch so its
+                  SSE engine builds for WebAssembly SIMD128); UCRT math shim
 docs/             BIT_EXACTNESS.md
 ```
 

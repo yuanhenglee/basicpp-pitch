@@ -13,7 +13,7 @@ from compare import compare  # noqa: E402
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bin", default="build/bpp.exe")
+    ap.add_argument("--bin", default="build/bpp.exe", help="CLI binary, or bpp.js of a WebAssembly build")
     ap.add_argument("--golden", default="golden/tf")
     ap.add_argument("--out", default="out/verify")
     ap.add_argument("--threads", default="0")
@@ -36,6 +36,8 @@ def main():
         out = pathlib.Path(args.out) / case.name
         out.mkdir(parents=True, exist_ok=True)
         cmd = [str(pathlib.Path(args.bin).resolve())]
+        if cmd[0].endswith(".js"):  # Emscripten build of the CLI
+            cmd.insert(0, "node")
         if args.stream_chunk_ms:
             cmd += ["stream", str(audio), "--chunk-ms", args.stream_chunk_ms]
         else:

@@ -51,13 +51,20 @@ BPP_API int bpp_engine_infer(bpp_engine* engine, const float* audio, size_t n, f
 
 /* Decodes a WAV file (librosa-identical) and runs inference with resampling overlapped. */
 BPP_API bpp_output* bpp_engine_infer_file(bpp_engine* engine, const char* path);
+/* Interleaved float32 PCM, n_frames frames of `channels` samples at any rate from 1 kHz to 1 MHz:
+   mixed to mono and resampled like librosa.load(sr=22050), then inferred. */
+BPP_API bpp_output* bpp_engine_infer_pcm(bpp_engine* engine, const float* audio, size_t n_frames, int sample_rate,
+                                         int channels);
 BPP_API int bpp_output_frames(const bpp_output* output);
 BPP_API void bpp_output_copy(const bpp_output* output, float* note, float* onset, float* contour);
 BPP_API void bpp_output_free(bpp_output* output);
 
+/* 22050 Hz mono input. */
 BPP_API bpp_stream* bpp_stream_new(int n_threads);
+/* Interleaved float32 input at any rate / channel count, converted like bpp_engine_infer_pcm. */
+BPP_API bpp_stream* bpp_stream_new_pcm(int n_threads, int sample_rate, int channels);
 BPP_API void bpp_stream_free(bpp_stream* stream);
-/* Both return the total number of frames computed so far (see bpp::Stream), or -1 on error
+/* push takes n frames (n * channels floats). Both return the total number of frames computed so far (see bpp::Stream), or -1 on error
    (including push after finish). finish() trims the output to basic-pitch's length. */
 BPP_API int bpp_stream_push(bpp_stream* stream, const float* audio, size_t n);
 BPP_API int bpp_stream_finish(bpp_stream* stream);

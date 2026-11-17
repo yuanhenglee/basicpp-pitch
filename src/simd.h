@@ -24,6 +24,22 @@
 
 namespace bpp::detail {
 
+// x * y + z with one rounding, like std::fma. Without hardware FMA (WebAssembly, x86-64 below v3)
+// std::fma is a slow library call. A float product is exact in double, so the double sum rounded
+// to float is already the fused result unless it lies exactly halfway between two floats; that is
+// musl's / FreeBSD's fmaf fast path, and the rare halfway case still goes to std::fma.
+inline float fmadd(float x, float y, float z) {
+#if defined(__FMA__) || defined(__ARM_FEATURE_FMA) || defined(_MSC_VER)
+    return std::fma(x, y, z);
+#else
+    const double r = static_cast<double>(x) * y + z;
+    uint64_t bits;
+    std::memcpy(&bits, &r, sizeof bits);
+    if ((bits & 0x1fffffff) != 0x10000000) return static_cast<float>(r);
+    return std::fma(x, y, z);
+#endif
+}
+
 // 64-byte aligned, zero-initialised float buffer.
 class FloatBuffer {
 public:

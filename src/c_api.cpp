@@ -2,10 +2,16 @@
 
 #include "bpp/bpp.h"
 
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <string>
+
+// js/index.js writes bpp_note_options through these byte offsets.
+static_assert(offsetof(bpp_note_options, maximum_frequency) == 32 && offsetof(bpp_note_options, infer_onsets) == 40 &&
+                  offsetof(bpp_note_options, multiple_pitch_bends) == 52 && offsetof(bpp_note_options, midi_tempo) == 56,
+              "update js/index.js (Wasm.withOptions) when bpp_note_options changes");
 
 struct bpp_engine {
     bpp::Engine engine;
@@ -13,7 +19,7 @@ struct bpp_engine {
 };
 struct bpp_stream {
     bpp::Stream stream;
-    explicit bpp_stream(int n) : stream(n) {}
+    bpp_stream(int n, int sample_rate, int channels) : stream(n, sample_rate, channels) {}
 };
 struct bpp_notes {
     std::vector<bpp::NoteEvent> notes;
@@ -107,6 +113,11 @@ bpp_output* bpp_engine_infer_file(bpp_engine* e, const char* path) {
     return guard([&] { return new bpp_output{e->engine.infer_file(path)}; }, static_cast<bpp_output*>(nullptr));
 }
 
+bpp_output* bpp_engine_infer_pcm(bpp_engine* e, const float* audio, size_t n_frames, int sample_rate, int channels) {
+    return guard([&] { return new bpp_output{e->engine.infer_pcm(audio, n_frames, sample_rate, channels)}; },
+                 static_cast<bpp_output*>(nullptr));
+}
+
 int bpp_output_frames(const bpp_output* o) { return o->out.n_frames; }
 
 void bpp_output_copy(const bpp_output* o, float* note, float* onset, float* contour) {
@@ -116,7 +127,11 @@ void bpp_output_copy(const bpp_output* o, float* note, float* onset, float* cont
 void bpp_output_free(bpp_output* o) { delete o; }
 
 bpp_stream* bpp_stream_new(int n_threads) {
-    return guard([&] { return new bpp_stream(n_threads); }, nullptr);
+    return bpp_stream_new_pcm(n_threads, bpp::kModelSampleRate, 1);
+}
+
+bpp_stream* bpp_stream_new_pcm(int n_threads, int sample_rate, int channels) {
+    return guard([&] { return new bpp_stream(n_threads, sample_rate, channels); }, nullptr);
 }
 
 void bpp_stream_free(bpp_stream* s) { delete s; }

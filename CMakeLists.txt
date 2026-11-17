@@ -21,6 +21,26 @@ if(BPP_ZIG_TOOLCHAIN)
   string(REPLACE "-" "_" _bpp_march "${_bpp_march}")  # zig spells CPU models x86_64_v3
 endif()
 
+# WebAssembly (Emscripten). The scalar kernels are used, optionally auto-vectorised with SIMD128;
+# there is no FMA contraction, so results stay bit-exact. Exceptions are native wasm exceptions,
+# which the C API turns into error codes.
+if(EMSCRIPTEN)
+  option(BPP_WASM_SIMD "Compile with WebAssembly SIMD128" ON)
+  option(BPP_WASM_THREADS "Build with pthreads (the page must be cross-origin isolated)" OFF)
+  set(_bpp_wasm_flags -fwasm-exceptions)
+  if(BPP_WASM_SIMD)
+    list(APPEND _bpp_wasm_flags -msimd128)
+  endif()
+  if(BPP_WASM_THREADS)
+    list(APPEND _bpp_wasm_flags -pthread)
+  endif()
+  add_compile_options(${_bpp_wasm_flags})
+  add_link_options(${_bpp_wasm_flags} -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=1MB)
+  if(BPP_WASM_THREADS)
+    add_link_options(-sPTHREAD_POOL_SIZE=navigator.hardwareConcurrency)
+  endif()
+endif()
+
 add_library(bpp_core OBJECT
   src/audio.cpp
   src/engine.cpp
@@ -56,6 +76,16 @@ if(BPP_WITH_SOXR)
   set(WITH_LSR_BINDINGS OFF CACHE BOOL "" FORCE)
   set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
   set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+  if(EMSCRIPTEN)
+    # Native builds resample with soxr's SSE engine (pffft). Emscripten compiles the same SSE code
+    # to SIMD128 with identical arithmetic; without SIMD soxr would use a different FFT.
+    if(BPP_WASM_SIMD)
+      set(SIMD32_C_FLAGS "-msse" CACHE STRING "" FORCE)
+    else()
+      set(WITH_CR32S OFF CACHE BOOL "" FORCE)
+    endif()
+    set(WITH_CR64S OFF CACHE BOOL "" FORCE)
+  endif()
   add_subdirectory(third_party/libsoxr EXCLUDE_FROM_ALL)
   if(NOT MSVC)
     target_compile_options(soxr PRIVATE -ffp-contract=off -w)  # MSVC-built wheels never fuse multiply-adds
@@ -75,17 +105,44 @@ add_library(bpp STATIC $<TARGET_OBJECTS:bpp_core>)
 target_include_directories(bpp PUBLIC include)
 target_link_libraries(bpp PUBLIC Threads::Threads)
 
-add_library(bpp_shared SHARED $<TARGET_OBJECTS:bpp_core>)
-set_target_properties(bpp_shared PROPERTIES OUTPUT_NAME basicpp_pitch PREFIX "")
-target_link_libraries(bpp_shared PRIVATE Threads::Threads)
 if(BPP_WITH_SOXR)
   target_link_libraries(bpp PUBLIC soxr)
-  target_link_libraries(bpp_shared PRIVATE soxr)
+endif()
+
+if(EMSCRIPTEN)
+  # ES module + .wasm exporting the C API, plus the JavaScript wrapper from js/. The output
+  # directory (build/js) is the npm package.
+  file(STRINGS include/bpp/bpp_c.h _bpp_decls REGEX "^BPP_API")
+  set(_bpp_exports _malloc _free)
+  foreach(_decl ${_bpp_decls})
+    string(REGEX MATCH "(bpp_[a-z_]+)[(]" _ "${_decl}")
+    list(APPEND _bpp_exports _${CMAKE_MATCH_1})
+  endforeach()
+  list(JOIN _bpp_exports "," _bpp_exports)
+  add_executable(bpp_wasm $<TARGET_OBJECTS:bpp_core>)
+  target_link_libraries(bpp_wasm PRIVATE bpp)
+  set_target_properties(bpp_wasm PROPERTIES OUTPUT_NAME basicpp_pitch_wasm SUFFIX ".mjs"
+                        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/js)
+  target_link_options(bpp_wasm PRIVATE -sMODULARIZE=1 -sEXPORT_ES6=1 -sEXPORT_NAME=createBasicppPitch
+                      -sENVIRONMENT=web,worker,node -sFORCE_FILESYSTEM=1
+                      -sEXPORTED_FUNCTIONS=${_bpp_exports}
+                      -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAP32,HEAPF32,HEAPF64,UTF8ToString,FS)
+  foreach(_f package.json index.js index.d.ts README.md)
+    configure_file(js/${_f} ${CMAKE_BINARY_DIR}/js/${_f} COPYONLY)
+  endforeach()
+else()
+  add_library(bpp_shared SHARED $<TARGET_OBJECTS:bpp_core>)
+  set_target_properties(bpp_shared PROPERTIES OUTPUT_NAME basicpp_pitch PREFIX "")
+  target_link_libraries(bpp_shared PRIVATE Threads::Threads)
+  if(BPP_WITH_SOXR)
+    target_link_libraries(bpp_shared PRIVATE soxr)
+  endif()
 endif()
 
 add_executable(bpp_cli apps/bpp_cli.cpp)
 set_target_properties(bpp_cli PROPERTIES OUTPUT_NAME bpp)
 target_link_libraries(bpp_cli PRIVATE bpp)
+target_include_directories(bpp_cli PRIVATE src)
 if(NOT MSVC)
   target_compile_options(bpp_cli PRIVATE -O2)
 endif()
@@ -97,7 +154,24 @@ if(BUILD_TESTING)
   add_test(NAME golden_fixture COMMAND test_fixture ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures megalovania_6s)
 endif()
 
-option(BPP_BUILD_DEBUG_TOOLS "Build internal debugging tools" ON)
+if(EMSCRIPTEN)
+  # The CLI and the test run under Node with direct host file access (ctest uses node as the
+  # cross-compiling emulator; tools/verify.py accepts --bin build-wasm/bpp.js).
+  foreach(_t bpp_cli test_fixture)
+    if(TARGET ${_t})
+      target_link_options(${_t} PRIVATE -sNODERAWFS=1 -sENVIRONMENT=node)
+    endif()
+  endforeach()
+  if(BUILD_TESTING)
+    add_test(NAME wasm_js_api COMMAND node ${CMAKE_CURRENT_SOURCE_DIR}/js/test.mjs ${CMAKE_BINARY_DIR}/js
+             ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/megalovania_6s)
+  endif()
+  set(_bpp_debug_tools_default OFF)
+else()
+  set(_bpp_debug_tools_default ON)
+endif()
+
+option(BPP_BUILD_DEBUG_TOOLS "Build internal debugging tools" ${_bpp_debug_tools_default})
 if(BPP_BUILD_DEBUG_TOOLS)
   add_executable(load_audio_dump tools/debug/load_audio_dump.cpp)
   target_link_libraries(load_audio_dump PRIVATE bpp)
