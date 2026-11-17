@@ -77,7 +77,9 @@ ctest --test-dir build-wasm        # fixture test and JavaScript API test, under
 `build-wasm/js/` is the npm package (`js/README.md`): an ES module wrapper around
 `basicpp_pitch_wasm.{mjs,wasm}`. `build-wasm/bpp.js` is the CLI for Node.js, accepted by
 `tools/verify.py --bin`. Options: `-DBPP_WASM_SIMD=OFF` for engines without SIMD128,
-`-DBPP_WASM_THREADS=ON` for pthreads (the page must be cross-origin isolated).
+`-DBPP_WASM_THREADS=ON` for the pthreads module `basicpp_pitch_wasm_mt.{mjs,wasm}` (build it in a
+second directory, e.g. `build-wasm-mt`; the page must be cross-origin isolated), loaded with
+`loadBasicPitch({ threads: true })`.
 
 Status:
 
@@ -119,6 +121,11 @@ std::vector<uint8_t> midi = bpp::notes_to_midi(notes);
 // decoded audio in any format: interleaved float32, mixed and resampled like librosa.load
 out = engine.infer_pcm(pcm, n_frames, /*sample_rate=*/48000, /*channels=*/2);
 
+// the same in batches of windows, e.g. to report progress or stop early
+std::vector<float> audio = bpp::convert_pcm(pcm, n_frames, 48000, 2);
+for (int w = 0, total = bpp::window_count(audio.size()); w < total; w += 8)
+    engine.infer_windows(audio.data(), audio.size(), w, std::min(8, total - w), out);
+
 // live input, e.g. 48 kHz mono from a microphone
 bpp::Stream stream(/*threads=*/2, /*sample_rate=*/48000, /*channels=*/1);
 while (capturing) stream.push(chunk, n_frames);
@@ -151,7 +158,9 @@ stream = bpp.Stream(2, sample_rate=48000)     # live input; push() float32 chunk
 import { loadBasicPitch } from "./build-wasm/js/index.js";
 
 const bp = await loadBasicPitch();
-const { notes, midi } = bp.transcribe(pcm, { sampleRate: 44100, channels: 2 });  // Float32Array, interleaved
+const { notes, midi } = bp.transcribe(pcm, {                                   // Float32Array, interleaved
+  sampleRate: 44100, channels: 2, onProgress: (f) => console.log(f),           // return false to cancel
+});
 const stream = bp.createStream({ sampleRate: 48000 });                         // live input
 ``` The package finds the shared library next to itself, in `build/`, or via
 `BASICPP_PITCH_LIB`.

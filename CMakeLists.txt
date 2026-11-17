@@ -121,7 +121,13 @@ if(EMSCRIPTEN)
   list(JOIN _bpp_exports "," _bpp_exports)
   add_executable(bpp_wasm $<TARGET_OBJECTS:bpp_core>)
   target_link_libraries(bpp_wasm PRIVATE bpp)
-  set_target_properties(bpp_wasm PROPERTIES OUTPUT_NAME basicpp_pitch_wasm SUFFIX ".mjs"
+  # The pthreads build is a second module next to the single-threaded one (loadBasicPitch({threads})).
+  if(BPP_WASM_THREADS)
+    set(_bpp_wasm_name basicpp_pitch_wasm_mt)
+  else()
+    set(_bpp_wasm_name basicpp_pitch_wasm)
+  endif()
+  set_target_properties(bpp_wasm PROPERTIES OUTPUT_NAME ${_bpp_wasm_name} SUFFIX ".mjs"
                         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/js)
   target_link_options(bpp_wasm PRIVATE -sMODULARIZE=1 -sEXPORT_ES6=1 -sEXPORT_NAME=createBasicppPitch
                       -sENVIRONMENT=web,worker,node -sFORCE_FILESYSTEM=1

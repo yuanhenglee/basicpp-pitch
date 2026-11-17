@@ -23,6 +23,9 @@ inline constexpr int kContourBinCount = 264;
 // Number of output frames basic-pitch produces for n_samples of 22050 Hz audio.
 int frame_count(size_t n_samples);
 
+// Number of analysis windows Engine::infer() runs for n_samples of 22050 Hz audio.
+int window_count(size_t n_samples);
+
 // Frame-level model output, row-major [n_frames][bins], 86.13 frames per second.
 struct ModelOutput {
     int n_frames = 0;
@@ -72,6 +75,12 @@ public:
     // result equals infer() on the converted audio, e.g. basic-pitch on a WAV file holding the
     // same samples.
     ModelOutput infer_pcm(const float* audio, size_t n_frames, int sample_rate, int channels = 1) const;
+
+    // Runs analysis windows [first, first + count) of infer() over 22050 Hz mono audio and writes
+    // their frames into out, which is first resized to frame_count(n_samples) frames if needed.
+    // Running every window once, in any batches, gives exactly infer()'s output: use it to report
+    // progress or to stop between batches.
+    void infer_windows(const float* audio, size_t n_samples, int first, int count, ModelOutput& out) const;
 
     // Decodes a WAV file like load_audio() and runs inference, overlapping resampling with the
     // network. Same result as infer() on load_audio(path).
@@ -132,6 +141,10 @@ std::vector<NoteEvent> output_to_notes(const ModelOutput& output, const NoteOpti
 
 // Serialises notes to a Standard MIDI File, byte-identical to basic-pitch's pretty_midi output.
 std::vector<uint8_t> notes_to_midi(const std::vector<NoteEvent>& notes, const NoteOptions& options = {});
+
+// Mixes interleaved float32 PCM to mono and resamples it to 22050 Hz like librosa.load: the
+// signal Engine::infer_pcm() runs the network on.
+std::vector<float> convert_pcm(const float* audio, size_t n_frames, int sample_rate, int channels = 1);
 
 // Decodes a WAV file to 22050 Hz mono float32 the way librosa.load(sr=22050, mono=True) does.
 // Integer PCM (8/16/24/32 bit) and float (32/64 bit), any channel count.

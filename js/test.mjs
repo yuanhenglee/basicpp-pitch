@@ -1,7 +1,7 @@
 // Checks the JavaScript API of a WebAssembly build against the golden fixture (MIDI bytes and note
 // pitches/times from basic-pitch), offline and streaming, from raw 44.1 kHz stereo PCM.
 //   node js/test.mjs <build>/js tests/fixtures/<name>
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -59,11 +59,24 @@ const identical = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const sameBytes = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
 
 const { pcm, channels, sampleRate } = readWav16(base + ".wav");
-const bp = await loadBasicPitch();
+// A pthreads build directory only holds basicpp_pitch_wasm_mt.mjs.
+const threads = !existsSync(join(resolve(pkgDir), "basicpp_pitch_wasm.mjs"));
+const bp = await loadBasicPitch({ threads });
+console.log(`       ${threads ? `pthreads build, ${bp.threads} threads` : "single-threaded build"}`);
 
 const t0 = performance.now();
-const result = bp.transcribe(pcm, { sampleRate, channels });
+const progress = [];
+const result = bp.transcribe(pcm, { sampleRate, channels, onProgress: (f) => void progress.push(f) });
 const ms = performance.now() - t0;
+check(progress.length > 0 && progress.every((f, i) => f > (progress[i - 1] ?? 0)) && progress.at(-1) === 1,
+      `transcribe: progress ${progress.map((f) => f.toFixed(2)).join(", ")}`);
+let cancelled = false;
+try {
+  bp.transcribe(pcm, { sampleRate, channels, onProgress: () => false });
+} catch (e) {
+  cancelled = /cancelled/.test(e.message);
+}
+check(cancelled, "transcribe: returning false from onProgress cancels");
 check(sameNotes(result.notes), `transcribe: ${result.notes.length} note events identical (amplitudes within ${AMPLITUDE_TOL})`);
 check(sameBytes(result.midi, goldenMidi), "transcribe: MIDI bytes identical");
 const seconds = pcm.length / channels / sampleRate;

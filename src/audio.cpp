@@ -113,6 +113,14 @@ std::vector<float> interleaved_to_mono(const float* audio, size_t frames, int ch
 
 }  // namespace detail
 
+std::vector<float> convert_pcm(const float* audio, size_t n_frames, int sample_rate, int channels) {
+    detail::check_pcm_format(sample_rate, channels);
+    std::vector<float> mono = channels == 1 ? std::vector<float>(audio, audio + n_frames)
+                                            : detail::interleaved_to_mono(audio, n_frames, channels);
+    if (sample_rate == kSampleRate) return mono;
+    return detail::resample_to_model_rate(mono, static_cast<uint32_t>(sample_rate));
+}
+
 std::vector<float> load_audio(const std::string& path) {
     detail::WavAudio wav = detail::decode_wav(path);
     if (wav.sample_rate == static_cast<uint32_t>(kSampleRate)) return std::move(wav.mono);

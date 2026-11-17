@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <algorithm>
 #include <fstream>
 #include <iterator>
 #include <sstream>
@@ -133,6 +134,16 @@ int main(int argc, char** argv) {
         check(same_output(stream.output(), out), "stream (chunk " + std::to_string(chunk) + ") equals offline model output");
     }
 
+    // Windows in batches (as for progress reporting) give the same output as one infer() call.
+    for (int batch : {1, 3}) {
+        bpp::ModelOutput batched;
+        const int total = bpp::window_count(audio.size());
+        for (int first = 0; first < total; first += batch)
+            engine.infer_windows(audio.data(), audio.size(), first, std::min(batch, total - first), batched);
+        check(same_output(batched, out),
+              "infer_windows in batches of " + std::to_string(batch) + " (" + std::to_string(total) + " windows) equals infer");
+    }
+
     // Raw PCM at the native rate: mixed to mono and resampled inside the engine.
     const Pcm pcm = read_pcm16(base + ".wav");
     check(pcm.channels > 1 && pcm.sample_rate != bpp::kModelSampleRate, "fixture is multichannel, not 22050 Hz");
@@ -140,6 +151,8 @@ int main(int argc, char** argv) {
     check(same_output(engine.infer_pcm(pcm.samples.data(), frames, pcm.sample_rate, pcm.channels), out),
           "infer_pcm (" + std::to_string(pcm.sample_rate) + " Hz, " + std::to_string(pcm.channels) +
               " ch) equals offline model output");
+    check(bpp::convert_pcm(pcm.samples.data(), frames, pcm.sample_rate, pcm.channels) == audio,
+          "convert_pcm equals load_audio");
     for (size_t chunk : {size_t(37), size_t(441), size_t(4096), size_t(60000)}) {
         bpp::Stream stream(chunk > 1000 ? 2 : 1, pcm.sample_rate, pcm.channels);
         for (size_t pos = 0; pos < frames; pos += chunk)

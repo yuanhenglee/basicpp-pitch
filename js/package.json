@@ -10,7 +10,7 @@
       "default": "./index.js"
     }
   },
-  "files": ["index.js", "index.d.ts", "basicpp_pitch_wasm.mjs", "basicpp_pitch_wasm.wasm", "README.md"],
+  "files": ["index.js", "index.d.ts", "basicpp_pitch_wasm*.mjs", "basicpp_pitch_wasm*.wasm", "README.md"],
   "engines": { "node": ">=18" },
   "repository": "github:yuanhenglee/basicpp-pitch"
 }

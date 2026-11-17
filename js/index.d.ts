@@ -42,10 +42,17 @@ export interface PcmFormat {
   channels?: number;
 }
 
-export declare function loadBasicPitch(moduleOptions?: Record<string, unknown>): Promise<BasicPitch>;
+/** `threads: true` loads the pthreads build (needs SharedArrayBuffer). */
+export declare function loadBasicPitch(options?: { threads?: boolean } & Record<string, unknown>): Promise<BasicPitch>;
+
+export interface TranscribeOptions extends PcmFormat, NoteOptions {
+  /** Called with the completed fraction as analysis windows finish; return false to cancel. */
+  onProgress?: (fraction: number) => boolean | void;
+}
 
 export declare class BasicPitch {
-  transcribe(audio: Float32Array, options?: PcmFormat & NoteOptions): Transcription;
+  readonly threads: number;
+  transcribe(audio: Float32Array, options?: TranscribeOptions): Transcription;
   createStream(options?: PcmFormat & { threads?: number }): Stream;
   dispose(): void;
 }

@@ -9,8 +9,9 @@ import { loadBasicPitch } from "basicpp-pitch";
 
 const bp = await loadBasicPitch();
 
-// Whole recording: interleaved float32 PCM at its native rate (resampled like librosa.load)
-const { notes, midi } = bp.transcribe(pcm, { sampleRate: 44100, channels: 2 });
+// Whole recording: interleaved float32 PCM at its native rate (resampled like librosa.load).
+// onProgress reports the completed fraction; returning false cancels.
+const { notes, midi } = bp.transcribe(pcm, { sampleRate: 44100, channels: 2, onProgress: (f) => {} });
 
 // Live input
 const stream = bp.createStream({ sampleRate: 48000 });
@@ -20,7 +21,9 @@ stream.finish();
 const all = stream.notes();
 ```
 
-Run it in a Web Worker for long files so the page stays responsive. The `.wasm` file is loaded
+Run it in a Web Worker for long files so the page stays responsive. `loadBasicPitch({ threads: true })`
+loads the pthreads build (`basicpp_pitch_wasm_mt`, needs a cross-origin isolated page) and spreads
+the work over all cores. The `.wasm` file is loaded
 next to `basicpp_pitch_wasm.mjs`; pass `{ locateFile }` to `loadBasicPitch` to serve it elsewhere.
 
 Build: see "WebAssembly" in the main README. This package includes libsoxr (LGPL-2.1); keep the

@@ -1,13 +1,18 @@
 // JavaScript API for the WebAssembly build of BasiCPP Pitch. Runs in browsers (main thread or Web
 // Worker) and Node.js 18+. Results are bit-identical to the C++ library and to basic-pitch.
-import createBasicppPitch from "./basicpp_pitch_wasm.mjs";
 
 const NOTE_BINS = 88;
 const CONTOUR_BINS = 264;
 
-/** Instantiates the WebAssembly module. `moduleOptions` go to Emscripten (e.g. `locateFile`). */
-export async function loadBasicPitch(moduleOptions = {}) {
-  return new BasicPitch(await createBasicppPitch(moduleOptions));
+/**
+ * Instantiates the WebAssembly module. `threads: true` loads the pthreads build
+ * (basicpp_pitch_wasm_mt.mjs, from -DBPP_WASM_THREADS=ON), which needs SharedArrayBuffer: a
+ * cross-origin isolated page, or Node.js. Other options go to Emscripten (e.g. `locateFile`).
+ */
+export async function loadBasicPitch({ threads = false, ...moduleOptions } = {}) {
+  const { default: create } = threads ? await import("./basicpp_pitch_wasm_mt.mjs") : await import("./basicpp_pitch_wasm.mjs");
+  const nThreads = threads ? Math.max(1, globalThis.navigator?.hardwareConcurrency ?? 4) : 1;
+  return new BasicPitch(await create(moduleOptions), nThreads);
 }
 
 class Wasm {
@@ -126,30 +131,57 @@ function frameCount(audio, channels) {
 export class BasicPitch {
   #w;
   #engine;
+  #threads;
 
-  constructor(m) {
+  constructor(m, threads = 1) {
     this.#w = new Wasm(m);
-    this.#engine = m._bpp_engine_new(0);
+    this.#threads = threads;
+    this.#engine = m._bpp_engine_new(threads);
     this.#w.check(this.#engine);
+  }
+
+  /** Threads the engine runs on. */
+  get threads() {
+    return this.#threads;
   }
 
   /**
    * Transcribes interleaved float32 PCM at any sample rate; resampling matches librosa.load, so
-   * the result equals basic-pitch on a WAV file holding the same samples.
+   * the result equals basic-pitch on a WAV file holding the same samples. `onProgress(fraction)`
+   * is called as analysis windows complete; returning false from it cancels (throws).
    */
-  transcribe(audio, { sampleRate = 22050, channels = 1, ...noteOptions } = {}) {
+  transcribe(audio, { sampleRate = 22050, channels = 1, onProgress, ...noteOptions } = {}) {
     const w = this.#w, m = w.m;
     const frames = frameCount(audio, channels);
-    const out = w.withFloats(audio, (p) => m._bpp_engine_infer_pcm(this.#engine, p, frames, sampleRate, channels));
-    w.check(out);
+    const pp = w.malloc(8);
+    let samples = 0, n = 0;
     try {
-      const n = m._bpp_output_frames(out);
-      return w.withFrames(n, (note, onset, contour) => {
+      w.check(w.withFloats(audio, (p) => m._bpp_convert_pcm(p, frames, sampleRate, channels, pp, pp + 4)) === 0);
+      samples = m.HEAP32[pp >> 2];
+      n = m.HEAP32[(pp + 4) >> 2] >>> 0;
+    } finally {
+      m._free(pp);
+    }
+    let out = 0;
+    try {
+      out = m._bpp_output_new(n);
+      w.check(out);
+      // Windows are independent, so batching them changes nothing but the progress granularity.
+      const total = m._bpp_window_count(n), batch = 2 * this.#threads;
+      for (let first = 0; first < total; first += batch) {
+        const count = Math.min(batch, total - first);
+        w.check(m._bpp_engine_infer_windows(this.#engine, samples, n, first, count, out) === 0);
+        if (onProgress?.((first + count) / total) === false) throw new Error("transcription cancelled");
+      }
+      if (total === 0) onProgress?.(1);
+      const nFrames = m._bpp_output_frames(out);
+      return w.withFrames(nFrames, (note, onset, contour) => {
         m._bpp_output_copy(out, note, onset, contour);
-        return w.decode(note, onset, contour, n, noteOptions);
+        return w.decode(note, onset, contour, nFrames, noteOptions);
       });
     } finally {
-      m._bpp_output_free(out);
+      if (out) m._bpp_output_free(out);
+      m._bpp_free_audio(samples);
     }
   }
 

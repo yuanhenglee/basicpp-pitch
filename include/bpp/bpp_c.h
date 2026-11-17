@@ -43,6 +43,8 @@ BPP_API void bpp_note_options_default(bpp_note_options* options);
 
 /* Number of output frames for n_samples of 22050 Hz audio. */
 BPP_API int bpp_frame_count(size_t n_samples);
+/* Number of analysis windows bpp_engine_infer runs for n_samples of 22050 Hz audio. */
+BPP_API int bpp_window_count(size_t n_samples);
 
 BPP_API bpp_engine* bpp_engine_new(int n_threads);
 BPP_API void bpp_engine_free(bpp_engine* engine);
@@ -55,6 +57,13 @@ BPP_API bpp_output* bpp_engine_infer_file(bpp_engine* engine, const char* path);
    mixed to mono and resampled like librosa.load(sr=22050), then inferred. */
 BPP_API bpp_output* bpp_engine_infer_pcm(bpp_engine* engine, const float* audio, size_t n_frames, int sample_rate,
                                          int channels);
+/* Empty output for n_samples of 22050 Hz audio, to fill with bpp_engine_infer_windows. */
+BPP_API bpp_output* bpp_output_new(size_t n_samples);
+/* Runs analysis windows [first, first + count) over 22050 Hz mono audio into output. Running every
+   window once, in any batches, gives bpp_engine_infer's result: report progress or stop between
+   batches. Returns 0, or -1 on error. */
+BPP_API int bpp_engine_infer_windows(bpp_engine* engine, const float* audio, size_t n_samples, int first, int count,
+                                     bpp_output* output);
 BPP_API int bpp_output_frames(const bpp_output* output);
 BPP_API void bpp_output_copy(const bpp_output* output, float* note, float* onset, float* contour);
 BPP_API void bpp_output_free(bpp_output* output);
@@ -84,6 +93,10 @@ BPP_API void bpp_notes_get_bends(const bpp_notes* notes, int i, int* bends);
 /* MIDI bytes; call with buf == NULL to get the size. */
 BPP_API size_t bpp_notes_midi(const bpp_notes* notes, const bpp_note_options* options, unsigned char* buf, size_t cap);
 
+/* Interleaved float32 PCM to 22050 Hz mono, as bpp_engine_infer_pcm sees it; free the samples with
+   bpp_free_audio. Returns 0 on success. */
+BPP_API int bpp_convert_pcm(const float* audio, size_t n_frames, int sample_rate, int channels, float** samples,
+                            size_t* n);
 /* Decodes a WAV file to 22050 Hz mono; free the samples with bpp_free_audio. Returns 0 on success. */
 BPP_API int bpp_load_audio(const char* path, float** samples, size_t* n);
 BPP_API void bpp_free_audio(float* samples);
