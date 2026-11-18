@@ -94,20 +94,32 @@ WavAudio decode_wav(const std::string& path) {
     };
 
     std::vector<float> mono(frames);
-    if (channels == 1) {
-        for (size_t i = 0; i < frames; ++i) mono[i] = sample(i, 0);
-    } else {
-        // np.mean(y, axis=0) in float32: sequential sum over channels, then divide by the count
-        for (size_t i = 0; i < frames; ++i) {
-            float s = sample(i, 0);
-            for (int c = 1; c < channels; ++c) s += sample(i, c);
-            mono[i] = s / static_cast<float>(channels);
-        }
-    }
+    mix_to_mono(frames, channels, sample, mono.data());
     return {std::move(mono), sample_rate};
 }
 
+void check_pcm_format(int sample_rate, int channels) {
+    if (channels < 1 || channels > 65535) throw std::invalid_argument("channel count must be 1..65535");
+    if (sample_rate < 1000 || sample_rate > 1000000)
+        throw std::invalid_argument("unsupported sample rate " + std::to_string(sample_rate) + " Hz");
+}
+
+std::vector<float> interleaved_to_mono(const float* audio, size_t frames, int channels) {
+    std::vector<float> mono(frames);
+    const size_t stride = static_cast<size_t>(channels);
+    mix_to_mono(frames, channels, [&](size_t i, int c) { return audio[i * stride + c]; }, mono.data());
+    return mono;
+}
+
 }  // namespace detail
+
+std::vector<float> convert_pcm(const float* audio, size_t n_frames, int sample_rate, int channels) {
+    detail::check_pcm_format(sample_rate, channels);
+    std::vector<float> mono = channels == 1 ? std::vector<float>(audio, audio + n_frames)
+                                            : detail::interleaved_to_mono(audio, n_frames, channels);
+    if (sample_rate == kSampleRate) return mono;
+    return detail::resample_to_model_rate(mono, static_cast<uint32_t>(sample_rate));
+}
 
 std::vector<float> load_audio(const std::string& path) {
     detail::WavAudio wav = detail::decode_wav(path);

@@ -72,10 +72,12 @@ _engine_new = _proto("bpp_engine_new", ctypes.c_void_p, ctypes.c_int)
 _engine_free = _proto("bpp_engine_free", None, ctypes.c_void_p)
 _engine_infer = _proto("bpp_engine_infer", ctypes.c_int, ctypes.c_void_p, _f32p, ctypes.c_size_t, _f32p, _f32p, _f32p)
 _engine_infer_file = _proto("bpp_engine_infer_file", ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p)
+_engine_infer_pcm = _proto("bpp_engine_infer_pcm", ctypes.c_void_p, ctypes.c_void_p, _f32p, ctypes.c_size_t,
+                           ctypes.c_int, ctypes.c_int)
 _output_frames = _proto("bpp_output_frames", ctypes.c_int, ctypes.c_void_p)
 _output_copy = _proto("bpp_output_copy", None, ctypes.c_void_p, _f32p, _f32p, _f32p)
 _output_free = _proto("bpp_output_free", None, ctypes.c_void_p)
-_stream_new = _proto("bpp_stream_new", ctypes.c_void_p, ctypes.c_int)
+_stream_new_pcm = _proto("bpp_stream_new_pcm", ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int)
 _stream_free = _proto("bpp_stream_free", None, ctypes.c_void_p)
 _stream_push = _proto("bpp_stream_push", ctypes.c_int, ctypes.c_void_p, _f32p, ctypes.c_size_t)
 _stream_finish = _proto("bpp_stream_finish", ctypes.c_int, ctypes.c_void_p)
@@ -147,6 +149,16 @@ def load_audio(path: Union[str, os.PathLike]) -> np.ndarray:
         _free_audio(buf)
 
 
+def _frames(audio: np.ndarray, channels: int) -> np.ndarray:
+    """C-contiguous float32 audio as (frames, channels); 1-D input is mono."""
+    audio = np.ascontiguousarray(audio, dtype=np.float32)
+    if audio.ndim == 1:
+        audio = audio[:, None]
+    if audio.ndim != 2 or audio.shape[1] != channels:
+        raise ValueError(f"expected audio of shape (n,) or (n, {channels}), got {audio.shape}")
+    return audio
+
+
 def _empty_output(n: int) -> dict:
     return {"note": np.empty((n, 88), np.float32), "onset": np.empty((n, 88), np.float32),
             "contour": np.empty((n, 264), np.float32)}
@@ -173,7 +185,17 @@ class Engine:
 
     def infer_file(self, path: Union[str, os.PathLike]) -> dict:
         """Decode a WAV file (like ``librosa.load``) and run inference, overlapping resampling with the network."""
-        h = _engine_infer_file(self._h, os.fsencode(os.fspath(path)))
+        return self._collect(_engine_infer_file(self._h, os.fsencode(os.fspath(path))))
+
+    def infer_pcm(self, audio: np.ndarray, sample_rate: int) -> dict:
+        """Audio at any rate, shape (n,) or (n, channels): mixed to mono and resampled like ``librosa.load``."""
+        audio = np.asarray(audio)
+        frames = _frames(audio, audio.shape[1] if audio.ndim == 2 else 1)
+        return self._collect(_engine_infer_pcm(self._h, _ptr(frames), frames.shape[0], int(sample_rate),
+                                               frames.shape[1]))
+
+    @staticmethod
+    def _collect(h) -> dict:
         _check(bool(h))
         try:
             out = _empty_output(_output_frames(h))
@@ -184,7 +206,9 @@ class Engine:
 
 
 class Stream:
-    """Incremental inference for live audio (22050 Hz mono float32 chunks).
+    """Incremental inference for live audio: float32 chunks of shape (n,) or (n, channels).
+
+    Input at another rate than 22050 Hz, or with several channels, is converted like ``Engine.infer_pcm``.
 
     ``push`` returns the frames computed for each completed analysis window right away. The values are
     final, but basic-pitch trims the tail of the sequence when the audio ends, so ``finish`` returns the
@@ -192,9 +216,10 @@ class Stream:
     of leading frames guaranteed to survive that trim.
     """
 
-    def __init__(self, n_threads: int = 1):
-        self._h = _stream_new(n_threads)
+    def __init__(self, n_threads: int = 1, sample_rate: int = 22050, channels: int = 1):
+        self._h = _stream_new_pcm(n_threads, int(sample_rate), int(channels))
         _check(bool(self._h))
+        self._channels = int(channels)
         self._read = 0
 
     def __del__(self):
@@ -213,8 +238,8 @@ class Stream:
 
     def push(self, audio: np.ndarray) -> dict:
         """Feeds samples; returns the newly computed frames (possibly none)."""
-        audio = np.ascontiguousarray(audio, dtype=np.float32)
-        return self._drain(_stream_push(self._h, _ptr(audio), audio.size))
+        frames = _frames(audio, self._channels)
+        return self._drain(_stream_push(self._h, _ptr(frames), frames.shape[0]))
 
     @property
     def final_frames(self) -> int:
@@ -268,8 +293,11 @@ _default_engine: Optional[Engine] = None
 
 
 def predict(audio: Union[str, os.PathLike, np.ndarray], options: Optional[NoteOptions] = None,
-            n_threads: int = 0) -> Prediction:
-    """Transcribe a WAV path or a 22050 Hz mono float32 array (``basic_pitch.inference.predict``)."""
+            n_threads: int = 0, sample_rate: int = 22050) -> Prediction:
+    """Transcribe a WAV path or an array (``basic_pitch.inference.predict``).
+
+    Arrays are (n,) mono or (n, channels) at ``sample_rate``, converted like ``librosa.load``.
+    """
     global _default_engine
     if n_threads:
         engine = Engine(n_threads)
@@ -277,5 +305,9 @@ def predict(audio: Union[str, os.PathLike, np.ndarray], options: Optional[NoteOp
         if _default_engine is None:
             _default_engine = Engine(0)
         engine = _default_engine
-    output = engine.infer(audio) if isinstance(audio, np.ndarray) else engine.infer_file(audio)
+    if isinstance(audio, np.ndarray):
+        mono_22k = audio.ndim == 1 and sample_rate == 22050
+        output = engine.infer(audio) if mono_22k else engine.infer_pcm(audio, sample_rate)
+    else:
+        output = engine.infer_file(audio)
     return output_to_notes(output, options)

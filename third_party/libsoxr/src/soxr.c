@@ -257,6 +257,8 @@ soxr_io_spec_t soxr_io_spec(
     return (edx_ & (SSE|SSE2)) != 0;
   #elif defined __aarch64__ || defined __arm64__
     return true;
+  #elif defined __wasm_simd128__ && defined __SSE__
+    return true;  /* basicpp-pitch: Emscripten's SSE-on-SIMD128 */
   #elif defined AV_CPU_FLAG_NEON
     return !!(av_get_cpu_flags() & AV_CPU_FLAG_NEON);
   #elif defined HWCAP_NEON

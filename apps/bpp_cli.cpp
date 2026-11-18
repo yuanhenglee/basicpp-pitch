@@ -7,6 +7,7 @@
 // Note options mirror basic-pitch's CLI: --onset-threshold, --frame-threshold, --minimum-note-length (ms),
 // --minimum-frequency, --maximum-frequency (Hz), --multiple-pitch-bends, --no-melodia, --midi-tempo.
 #include "bpp/bpp.h"
+#include "wav.h"  // native-rate decoding, to feed Stream like a live source
 
 #include <algorithm>
 #include <charconv>
@@ -215,16 +216,19 @@ int cmd_bench(const Args& a) {
     return 0;
 }
 
+// Pushes the file at its native sample rate, so non-22050 Hz input exercises Stream's resampler.
 int cmd_stream(const Args& a) {
-    const auto audio = bpp::load_audio(a.input);
-    const size_t chunk = std::max<size_t>(1, static_cast<size_t>(a.chunk_ms * 1e-3 * bpp::kModelSampleRate));
-    bpp::Stream stream(std::max(1, a.threads));
+    const bpp::detail::WavAudio wav = bpp::detail::decode_wav(a.input);
+    const std::vector<float>& audio = wav.mono;
+    const double rate = wav.sample_rate;
+    const size_t chunk = std::max<size_t>(1, static_cast<size_t>(a.chunk_ms * 1e-3 * rate));
+    bpp::Stream stream(std::max(1, a.threads), static_cast<int>(wav.sample_rate));
     std::vector<double> lat;  // compute time of pushes that ran a window
     const auto t_start = Clock::now();
     for (size_t pos = 0; pos < audio.size(); pos += chunk) {
         const size_t n = std::min(chunk, audio.size() - pos);
         if (a.realtime) {
-            const auto due = t_start + std::chrono::duration<double>(double(pos + n) / bpp::kModelSampleRate);
+            const auto due = t_start + std::chrono::duration<double>(double(pos + n) / rate);
             std::this_thread::sleep_until(due);
         }
         const int windows_before = stream.windows_processed();
@@ -240,7 +244,7 @@ int cmd_stream(const Args& a) {
     const double t_notes = seconds_since(t1);
     const double total = seconds_since(t_start);
     std::sort(lat.begin(), lat.end());
-    const double dur = double(audio.size()) / bpp::kModelSampleRate;
+    const double dur = double(audio.size()) / rate;
     std::printf("streamed %.2f s in %.0f ms chunks: %zu window pushes, per-window compute median %.2f ms, max %.2f ms "
                 "(budget %.0f ms); finish %.1f ms, notes %.1f ms, wall %.2f s, %zu notes\n",
                 dur, a.chunk_ms, lat.size(), lat.empty() ? 0 : lat[lat.size() / 2] * 1e3,

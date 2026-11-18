@@ -75,4 +75,87 @@ std::vector<float> resample_to_model_rate(const std::vector<float>& mono, uint32
     return y;
 }
 
+#ifdef BPP_HAVE_SOXR
+
+struct StreamResampler::Impl {
+    soxr_t soxr = nullptr;
+    uint32_t sample_rate = 0;
+    size_t n_in = 0;      // input samples consumed
+    size_t n_out = 0;     // result samples handed out
+    std::vector<float> pending;  // resampler output not yet handed out
+
+    // Feeds in[0, n) (all of it, like the offline path: no idone) or, if in == nullptr, flushes; then
+    // collects output until the resampler has none left.
+    void drain(const float* in, size_t n) {
+        const float dummy = 0;
+        const float* in_ptr = in;
+        size_t ilen = n;
+        for (;;) {
+            const size_t cap = static_cast<size_t>(double(ilen) * kSampleRate / sample_rate) + 4096;
+            const size_t old = pending.size();
+            pending.resize(old + cap);
+            float* out_ptr = pending.data() + old;
+            size_t odone = 0;
+            const soxr_error_t err = soxr_process(soxr, in_ptr ? &in_ptr : nullptr, ilen, nullptr, &out_ptr, cap, &odone);
+            pending.resize(old + odone);
+            if (err) throw std::runtime_error(std::string("soxr_process: ") + err);
+            if (odone < cap) return;
+            if (in_ptr) in_ptr = &dummy, ilen = 0;  // more output pending: drain without input or flushing
+        }
+    }
+
+    // Hands out pending samples, never more than the final result length allows so far.
+    void emit(size_t limit, std::vector<float>& out) {
+        const size_t k = std::min(pending.size(), limit - std::min(limit, n_out));
+        out.insert(out.end(), pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(k));
+        pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(k));
+        n_out += k;
+    }
+};
+
+StreamResampler::StreamResampler(uint32_t sample_rate) : impl_(std::make_unique<Impl>()) {
+    if (sample_rate == 0) throw std::invalid_argument("sample rate must be positive");
+    impl_->sample_rate = sample_rate;
+    soxr_error_t err = nullptr;
+    const soxr_io_spec_t io_spec = soxr_io_spec(SOXR_FLOAT32_S, SOXR_FLOAT32_S);
+    const soxr_quality_spec_t quality_spec = soxr_quality_spec(SOXR_HQ, 0);
+    impl_->soxr = soxr_create(sample_rate, kSampleRate, 1, &err, &io_spec, &quality_spec, nullptr);
+    if (err) throw std::runtime_error(std::string("soxr_create: ") + err);
+}
+
+StreamResampler::~StreamResampler() { soxr_delete(impl_->soxr); }
+
+void StreamResampler::push(const float* mono, size_t n, std::vector<float>& out) {
+    if (n == 0) return;
+    impl_->drain(mono, n);
+    impl_->n_in += n;
+    // the result is finally trimmed to resampled_length(total input), which only grows
+    impl_->emit(resampled_length(impl_->n_in, impl_->sample_rate), out);
+}
+
+void StreamResampler::finish(std::vector<float>& out) {
+    Impl& s = *impl_;
+    if (s.n_in > 0) s.drain(nullptr, 0);
+    const size_t n_result = resampled_length(s.n_in, s.sample_rate);
+    s.emit(n_result, out);
+    out.resize(out.size() + (n_result - s.n_out), 0.0f);
+    s.n_out = n_result;
+    s.pending.clear();
+}
+
+#else
+
+struct StreamResampler::Impl {};
+
+StreamResampler::StreamResampler(uint32_t sample_rate) {
+    throw std::runtime_error("sample rate " + std::to_string(sample_rate) +
+                             " Hz needs resampling, but this build has no libsoxr (BPP_WITH_SOXR=OFF)");
+}
+
+StreamResampler::~StreamResampler() = default;
+void StreamResampler::push(const float*, size_t, std::vector<float>&) {}
+void StreamResampler::finish(std::vector<float>&) {}
+
+#endif
+
 }  // namespace bpp::detail

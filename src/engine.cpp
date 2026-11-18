@@ -14,6 +14,9 @@
 #include <exception>
 #include <functional>
 #include <mutex>
+#include <stdexcept>
+#include <string>
+#include <system_error>
 #include <thread>
 
 namespace bpp {
@@ -35,7 +38,7 @@ constexpr int kLeadPad = kOverlapSamples / 2;  // 3840
 int output_frame_count(size_t n_samples) { return frame_count(n_samples); }
 
 // Windows start every kWindowHop samples of the padded signal: range(0, n + 3840, hop).
-int window_count(size_t n_samples) {
+int padded_window_count(size_t n_samples) {
     const size_t padded = n_samples + kLeadPad;
     return static_cast<int>((padded + kWindowHop - 1) / kWindowHop);
 }
@@ -43,7 +46,7 @@ int window_count(size_t n_samples) {
 // Windows whose kept frames survive the final trim to output_frame_count().
 int useful_window_count(size_t n_samples) {
     const int frames = output_frame_count(n_samples);
-    return std::min(window_count(n_samples), (frames + kUsedFrames - 1) / kUsedFrames);
+    return std::min(padded_window_count(n_samples), (frames + kUsedFrames - 1) / kUsedFrames);
 }
 
 // One past the last audio sample window w reads.
@@ -112,6 +115,9 @@ struct Engine::Impl {
 
     // Runs every window; wait_for(k), if given, blocks until audio[0, k) is available.
     ModelOutput run(const float* audio, size_t n_samples, const std::function<void(size_t)>* wait_for);
+    // Runs windows [first, end) into out (already sized), in parallel.
+    void run_windows(const float* audio, size_t n_samples, int first, int end, ModelOutput& out,
+                     const std::function<void(size_t)>* wait_for);
     std::mutex mu;
     std::vector<std::unique_ptr<ThreadState>> idle;  // cached scratch memory
 
@@ -144,25 +150,48 @@ int Engine::threads() const { return impl_->n_threads; }
 
 ModelOutput Engine::infer(const float* audio, size_t n_samples) const { return impl_->run(audio, n_samples, nullptr); }
 
+int window_count(size_t n_samples) { return useful_window_count(n_samples); }
+
+void Engine::infer_windows(const float* audio, size_t n_samples, int first, int count, ModelOutput& out) const {
+    const int total = useful_window_count(n_samples);
+    if (first < 0 || count < 0 || first > total || count > total - first)
+        throw std::out_of_range("window range [" + std::to_string(first) + ", +" + std::to_string(count) +
+                                ") outside 0.." + std::to_string(total));
+    const int frames = output_frame_count(n_samples);
+    if (out.n_frames != frames || out.note.size() != size_t(frames) * kNoteBins) resize_output(out, frames);
+    impl_->run_windows(audio, n_samples, first, first + count, out, nullptr);
+}
+
 ModelOutput Engine::infer_file(const std::string& path) const {
-    detail::WavAudio wav = detail::decode_wav(path);
-    if (wav.sample_rate == static_cast<uint32_t>(kSampleRate)) return infer(wav.mono.data(), wav.mono.size());
+    const detail::WavAudio wav = detail::decode_wav(path);
+    return infer_mono(wav.mono.data(), wav.mono.size(), static_cast<int>(wav.sample_rate));
+}
+
+ModelOutput Engine::infer_pcm(const float* audio, size_t n_frames, int sample_rate, int channels) const {
+    detail::check_pcm_format(sample_rate, channels);
+    if (channels == 1) return infer_mono(audio, n_frames, sample_rate);
+    const std::vector<float> mono = detail::interleaved_to_mono(audio, n_frames, channels);
+    return infer_mono(mono.data(), mono.size(), sample_rate);
+}
+
+ModelOutput Engine::infer_mono(const float* mono, size_t n_in, int sample_rate) const {
+    if (sample_rate == kSampleRate) return infer(mono, n_in);
+    const auto rate = static_cast<uint32_t>(sample_rate);
 
     // Resample on a producer thread; each window starts as soon as its samples exist.
-    const size_t n = detail::resampled_length(wav.mono.size(), wav.sample_rate);
-    std::vector<float> audio(detail::resampler_capacity(wav.mono.size(), wav.sample_rate), 0.0f);
+    const size_t n = detail::resampled_length(n_in, rate);
+    std::vector<float> audio(detail::resampler_capacity(n_in, rate), 0.0f);
     std::mutex mu;
     std::condition_variable cv;
     size_t ready = 0;
     std::exception_ptr error;
     auto produce = [&] {
         try {
-            detail::resample_to_model_rate(wav.mono.data(), wav.mono.size(), wav.sample_rate, audio.data(),
-                                           [&](size_t k) {
-                                               std::lock_guard<std::mutex> lock(mu);
-                                               ready = k;
-                                               cv.notify_all();
-                                           });
+            detail::resample_to_model_rate(mono, n_in, rate, audio.data(), [&](size_t k) {
+                std::lock_guard<std::mutex> lock(mu);
+                ready = k;
+                cv.notify_all();
+            });
         } catch (...) {
             std::lock_guard<std::mutex> lock(mu);
             error = std::current_exception();
@@ -174,15 +203,20 @@ ModelOutput Engine::infer_file(const std::string& path) const {
         std::unique_lock<std::mutex> lock(mu);
         cv.wait(lock, [&] { return ready >= k; });
     };
-    std::thread producer(produce);
+    std::thread producer;
+    try {
+        producer = std::thread(produce);
+    } catch (const std::system_error&) {
+        produce();  // no threads (e.g. WebAssembly without pthreads): resample everything first
+    }
     ModelOutput out;
     try {
         out = impl_->run(audio.data(), n, &wait_for);
     } catch (...) {
-        producer.join();
+        if (producer.joinable()) producer.join();
         throw;
     }
-    producer.join();
+    if (producer.joinable()) producer.join();
     if (error) std::rethrow_exception(error);
     return out;
 }
@@ -190,16 +224,20 @@ ModelOutput Engine::infer_file(const std::string& path) const {
 ModelOutput Engine::Impl::run(const float* audio, size_t n_samples, const std::function<void(size_t)>* wait_for) {
     ModelOutput out;
     resize_output(out, output_frame_count(n_samples));
-    const int n_windows = useful_window_count(n_samples);
-    if (n_windows <= 0) return out;
+    run_windows(audio, n_samples, 0, useful_window_count(n_samples), out, wait_for);
+    return out;
+}
 
-    std::atomic<int> next{0};
+void Engine::Impl::run_windows(const float* audio, size_t n_samples, int first, int end, ModelOutput& out,
+                               const std::function<void(size_t)>* wait_for) {
+    if (end <= first) return;
+    std::atomic<int> next{first};
     std::mutex error_mu;
     std::exception_ptr error;
     auto worker = [&] {
         try {
             auto state = acquire();
-            for (int w; (w = next.fetch_add(1)) < n_windows;) {
+            for (int w; (w = next.fetch_add(1)) < end;) {
                 if (wait_for) (*wait_for)(window_end_sample(w, n_samples));
                 extract_window(audio, n_samples, w, state->window.data());
                 run_window(state->window.data(), w, state->ws, out, state->tmp.data());
@@ -208,10 +246,10 @@ ModelOutput Engine::Impl::run(const float* audio, size_t n_samples, const std::f
         } catch (...) {
             std::lock_guard<std::mutex> lock(error_mu);
             if (!error) error = std::current_exception();
-            next.store(n_windows);  // stop the other workers early
+            next.store(end);  // stop the other workers early
         }
     };
-    const int n_workers = std::min(n_threads, n_windows);
+    const int n_workers = std::min(n_threads, end - first);
     std::vector<std::thread> pool;
     pool.reserve(n_workers - 1);
     try {
@@ -222,7 +260,6 @@ ModelOutput Engine::Impl::run(const float* audio, size_t n_samples, const std::f
     worker();
     for (auto& t : pool) t.join();
     if (error) std::rethrow_exception(error);
-    return out;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -234,12 +271,18 @@ class RowPool {
 public:
     explicit RowPool(int n_threads) {
         try {
-            for (int i = 1; i < n_threads; ++i) threads_.emplace_back([this, i] { loop(i); });
+            for (int i = 1; i < n_threads; ++i) {
+                try {
+                    threads_.emplace_back([this, i] { loop(i); });
+                } catch (const std::system_error&) {
+                    break;  // run with the helpers that started (none in WebAssembly without pthreads)
+                }
+            }
         } catch (...) {
             shutdown();
             throw;
         }
-        n_ = n_threads;
+        n_ = static_cast<int>(threads_.size()) + 1;
     }
     ~RowPool() { shutdown(); }
 
@@ -311,13 +354,19 @@ private:
 }  // namespace
 
 struct Stream::Impl {
-    explicit Impl(int threads) : n_threads(std::clamp(threads, 1, kMaxStreamThreads)), pool(n_threads) {
+    Impl(int threads, int sample_rate, int channels)
+        : n_threads(std::clamp(threads, 1, kMaxStreamThreads)), channels(channels), pool(n_threads) {
+        detail::check_pcm_format(sample_rate, channels);
+        if (sample_rate != kSampleRate) resampler = std::make_unique<detail::StreamResampler>(sample_rate);
         runner = [this](int b, int e, const std::function<void(int, int)>& fn) { pool.run(b, e, fn); };
         buffer.assign(kLeadPad, 0.0f);
     }
 
     static constexpr int kMaxStreamThreads = 64;
     const int n_threads;
+    const int channels;
+    std::unique_ptr<detail::StreamResampler> resampler;  // null for 22050 Hz input
+    std::vector<float> mono, resampled;  // conversion scratch
     ThreadState state;
     RowPool pool;
     detail::RowRunner runner;
@@ -328,6 +377,17 @@ struct Stream::Impl {
     int next_window = 0;
     bool finished = false;
     ModelOutput out;  // every computed frame; trimmed to basic-pitch's length by finish()
+
+    // Appends 22050 Hz mono samples and runs every analysis window that became complete.
+    void push_model(const float* audio, size_t n) {
+        buffer.insert(buffer.end(), audio, audio + n);
+        n_samples += n;
+        padded_len += static_cast<long long>(n);
+        while (static_cast<long long>(next_window) * kWindowHop + kWindowSamples <= padded_len) {
+            process(next_window);
+            ++next_window;  // only after the window's frames are stored
+        }
+    }
 
     void process(int w) {
         const long long start = static_cast<long long>(w) * kWindowHop;
@@ -359,20 +419,26 @@ struct Stream::Impl {
     }
 };
 
-Stream::Stream(int n_threads) : impl_(std::make_unique<Impl>(n_threads)) {}
+Stream::Stream(int n_threads, int sample_rate, int channels)
+    : impl_(std::make_unique<Impl>(n_threads, sample_rate, channels)) {}
 
 Stream::~Stream() = default;
 
-int Stream::push(const float* audio, size_t n) {
+int Stream::push(const float* audio, size_t n_frames) {
     Impl& s = *impl_;
     if (s.finished) throw std::logic_error("Stream::push after finish()");
     const int before = s.out.n_frames;
-    s.buffer.insert(s.buffer.end(), audio, audio + n);
-    s.n_samples += n;
-    s.padded_len += static_cast<long long>(n);
-    while (static_cast<long long>(s.next_window) * kWindowHop + kWindowSamples <= s.padded_len) {
-        s.process(s.next_window);
-        ++s.next_window;  // only after the window's frames are stored
+    const float* mono = audio;
+    if (s.channels > 1) {
+        s.mono = detail::interleaved_to_mono(audio, n_frames, s.channels);
+        mono = s.mono.data();
+    }
+    if (s.resampler) {
+        s.resampled.clear();
+        s.resampler->push(mono, n_frames, s.resampled);
+        s.push_model(s.resampled.data(), s.resampled.size());
+    } else {
+        s.push_model(mono, n_frames);
     }
     return s.out.n_frames - before;
 }
@@ -382,6 +448,12 @@ int Stream::finish() {
     if (s.finished) return 0;
     s.finished = true;
     const int before = s.out.n_frames;
+    if (s.resampler) {
+        s.resampled.clear();
+        s.resampler->finish(s.resampled);
+        s.push_model(s.resampled.data(), s.resampled.size());
+        s.resampler.reset();
+    }
     const int n_windows = useful_window_count(s.n_samples);
     while (s.next_window < n_windows) {
         s.process(s.next_window);
