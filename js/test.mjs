@@ -59,10 +59,11 @@ const identical = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const sameBytes = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
 
 const { pcm, channels, sampleRate } = readWav16(base + ".wav");
-// A pthreads build directory only holds basicpp_pitch_wasm_mt.mjs.
-const threads = !existsSync(join(resolve(pkgDir), "basicpp_pitch_wasm.mjs"));
-const bp = await loadBasicPitch({ threads });
-console.log(`       ${threads ? `pthreads build, ${bp.threads} threads` : "single-threaded build"}`);
+// A build directory holds one variant: basicpp_pitch_wasm[_mt][_rs].mjs.
+const variant = ["", "_rs", "_mt", "_mt_rs"].find((v) => existsSync(join(resolve(pkgDir), `basicpp_pitch_wasm${v}.mjs`)));
+const threads = variant.startsWith("_mt"), relaxed = variant.endsWith("_rs");
+const bp = await loadBasicPitch({ threads, relaxed });
+console.log(`       ${threads ? `pthreads build, ${bp.threads} threads` : "single-threaded build"}, kernels: ${bp.kernel}`);
 
 const t0 = performance.now();
 const progress = [];

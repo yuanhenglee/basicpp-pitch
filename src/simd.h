@@ -72,6 +72,15 @@ inline v128_t f64x2_pair_f32x4(v128_t lo, v128_t hi) {
     return wasm_i32x4_shuffle(wasm_f32x4_demote_f64x2_zero(lo), wasm_f32x4_demote_f64x2_zero(hi), 0, 1, 4, 5);
 }
 
+#if defined(__wasm_relaxed_simd__)
+#define BPP_RELAXED_SIMD 1
+// f32x4.relaxed_madd rounds once (fused, as on x86 FMA3 and ARM64) or twice, as the engine chooses
+// for the hardware. Kernels use it only after relaxed_madd_is_fused() has seen the fused result.
+bool relaxed_madd_is_fused();
+#else
+#define BPP_RELAXED_SIMD 0
+#endif
+
 // x86 maxps / minps (second operand on ties and NaN); wasm's max / min follow IEEE instead.
 inline v128_t max_x86(v128_t a, v128_t b) { return wasm_f32x4_pmax(b, a); }
 inline v128_t min_x86(v128_t a, v128_t b) { return wasm_f32x4_pmin(b, a); }

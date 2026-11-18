@@ -30,6 +30,8 @@ struct Workspace {
     FloatBuffer cat;                        // [note, onset hidden], channel-major [33][172][96]
 };
 
+const char* kernel_name();  // see bpp::kernel_name()
+
 // Called with a row range; must run fn over all of it, possibly split across threads.
 using RowRunner = std::function<void(int begin, int end, const std::function<void(int, int)>& fn)>;
 

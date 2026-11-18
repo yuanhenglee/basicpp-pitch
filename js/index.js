@@ -4,15 +4,50 @@
 const NOTE_BINS = 88;
 const CONTOUR_BINS = 264;
 
+// A module using f32x4.relaxed_madd; it validates only where relaxed SIMD is supported.
+const RELAXED_SIMD_PROBE = new Uint8Array([
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 61, 1, 59, 0, 253, 12, ...new Array(16).fill(0),
+  253, 12, ...new Array(16).fill(0), 253, 12, ...new Array(16).fill(0), 253, 133, 2, 11,
+]);
+
+/** Whether this JavaScript engine supports WebAssembly relaxed SIMD. */
+export function hasRelaxedSimd() {
+  try {
+    return WebAssembly.validate(RELAXED_SIMD_PROBE);
+  } catch {
+    return false;
+  }
+}
+
+// Static import() calls per variant, so bundlers can see every file.
+const VARIANTS = {
+  "": () => import("./basicpp_pitch_wasm.mjs"),
+  _rs: () => import("./basicpp_pitch_wasm_rs.mjs"),
+  _mt: () => import("./basicpp_pitch_wasm_mt.mjs"),
+  _mt_rs: () => import("./basicpp_pitch_wasm_mt_rs.mjs"),
+};
+
 /**
- * Instantiates the WebAssembly module. `threads: true` loads the pthreads build
- * (basicpp_pitch_wasm_mt.mjs, from -DBPP_WASM_THREADS=ON), which needs SharedArrayBuffer: a
- * cross-origin isolated page, or Node.js. Other options go to Emscripten (e.g. `locateFile`).
+ * Instantiates the WebAssembly module. `threads: true` loads the pthreads build (_mt, from
+ * -DBPP_WASM_THREADS=ON), which needs SharedArrayBuffer: a cross-origin isolated page, or Node.js.
+ * `relaxed` ("auto" by default) loads the relaxed SIMD build (_rs, -DBPP_WASM_RELAXED=ON) where
+ * the engine supports it, falling back to the plain SIMD build. Other options go to Emscripten
+ * (e.g. `locateFile`).
  */
-export async function loadBasicPitch({ threads = false, ...moduleOptions } = {}) {
-  const { default: create } = threads ? await import("./basicpp_pitch_wasm_mt.mjs") : await import("./basicpp_pitch_wasm.mjs");
+export async function loadBasicPitch({ threads = false, relaxed = "auto", ...moduleOptions } = {}) {
+  const base = threads ? "_mt" : "";
+  const useRelaxed = relaxed === true || (relaxed === "auto" && hasRelaxedSimd());
+  let mod;
+  if (useRelaxed) {
+    try {
+      mod = await VARIANTS[`${base}_rs`]();
+    } catch (err) {
+      if (relaxed === true) throw err;
+    }
+  }
+  mod ??= await VARIANTS[base]();
   const nThreads = threads ? Math.max(1, globalThis.navigator?.hardwareConcurrency ?? 4) : 1;
-  return new BasicPitch(await create(moduleOptions), nThreads);
+  return new BasicPitch(await mod.default(moduleOptions), nThreads);
 }
 
 class Wasm {
@@ -143,6 +178,11 @@ export class BasicPitch {
   /** Threads the engine runs on. */
   get threads() {
     return this.#threads;
+  }
+
+  /** Network kernels in use: "simd128-relaxed", "simd128", "avx2" or "scalar". */
+  get kernel() {
+    return this.#w.m.UTF8ToString(this.#w.m._bpp_kernel_name());
   }
 
   /**

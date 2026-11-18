@@ -83,6 +83,8 @@ extern "C" {
 
 const char* bpp_last_error(void) { return g_error.c_str(); }
 
+const char* bpp_kernel_name(void) { return bpp::kernel_name(); }
+
 void bpp_note_options_default(bpp_note_options* o) {
     const bpp::NoteOptions d;
     o->onset_threshold = d.onset_threshold;

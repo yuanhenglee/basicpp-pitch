@@ -39,6 +39,9 @@ typedef struct {
 /* Returns a message for the last error on this thread, or "" */
 BPP_API const char* bpp_last_error(void);
 
+/* Kernels in use: "avx2", "simd128-relaxed", "simd128" or "scalar" (see bpp::kernel_name). */
+BPP_API const char* bpp_kernel_name(void);
+
 BPP_API void bpp_note_options_default(bpp_note_options* options);
 
 /* Number of output frames for n_samples of 22050 Hz audio. */

@@ -152,6 +152,8 @@ ModelOutput Engine::infer(const float* audio, size_t n_samples) const { return i
 
 int window_count(size_t n_samples) { return useful_window_count(n_samples); }
 
+const char* kernel_name() { return detail::kernel_name(); }
+
 void Engine::infer_windows(const float* audio, size_t n_samples, int first, int count, ModelOutput& out) const {
     const int total = useful_window_count(n_samples);
     if (first < 0 || count < 0 || first > total || count > total - first)

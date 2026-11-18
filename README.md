@@ -75,11 +75,13 @@ ctest --test-dir build-wasm        # fixture test and JavaScript API test, under
 ```
 
 `build-wasm/js/` is the npm package (`js/README.md`): an ES module wrapper around
-`basicpp_pitch_wasm.{mjs,wasm}`. `build-wasm/bpp.js` is the CLI for Node.js, accepted by
+`basicpp_pitch_wasm[_mt][_rs].{mjs,wasm}` (one module per build variant). `build-wasm/bpp.js` is the CLI for Node.js, accepted by
 `tools/verify.py --bin`. Options: `-DBPP_WASM_SIMD=OFF` for engines without SIMD128,
-`-DBPP_WASM_THREADS=ON` for the pthreads module `basicpp_pitch_wasm_mt.{mjs,wasm}` (build it in a
-second directory, e.g. `build-wasm-mt`; the page must be cross-origin isolated), loaded with
-`loadBasicPitch({ threads: true })`.
+`-DBPP_WASM_THREADS=ON` for the pthreads module `basicpp_pitch_wasm_mt` (build it in a second
+directory, e.g. `build-wasm-mt`; the page must be cross-origin isolated), loaded with
+`loadBasicPitch({ threads: true })`, and `-DBPP_WASM_RELAXED=ON` for the relaxed-SIMD module
+(`_rs`, see below). `loadBasicPitch` picks the relaxed module when the engine supports relaxed SIMD
+(`relaxed: "auto"`) and falls back to the plain SIMD one, so ship both.
 
 Status:
 
@@ -88,11 +90,22 @@ Status:
   library's `sin`/`cos`/`exp`; the golden output comes from Windows (Universal CRT) and WebAssembly
   uses musl. Note times, pitches, pitch bends and MIDI bytes stay identical, amplitudes differ by
   ~1e-5. Linux builds (glibc) are in the same position.
-* Speed (160 s song, Core Ultra 5 135U, Node.js 22): 4x real time on one thread, 10x on 4 threads,
-  13x on 8 (`-DBPP_WASM_THREADS=ON`). SIMD128 has no deterministic fused multiply-add, so the
-  kernels run each FMA chain in f64x2: the product of two floats is exact in double, and rounding
-  the double sum to float gives the fused result except when it lands exactly halfway between two
-  floats, which is detected and recomputed with scalar FMAs (`fma_f64x2` in `src/simd.h`).
+* Speed (160 s song, Core Ultra 5 135U, Node.js 22):
+
+  | build | 1 thread | 8 threads |
+  |---|---|---|
+  | SIMD128 (`basicpp_pitch_wasm`) | 4x real time | 13x |
+  | SIMD128 + relaxed (`_rs`) | 30x | 98x |
+
+  Plain SIMD128 has no deterministic fused multiply-add, so its kernels run each FMA chain in
+  f64x2: the product of two floats is exact in double, and rounding the double sum to float gives
+  the fused result except when it lands exactly halfway between two floats, which is detected and
+  recomputed with scalar FMAs (`fma_f64x2` in `src/simd.h`). The relaxed build uses
+  `f32x4.relaxed_madd` instead, which the standard allows to round once or twice: at start-up a
+  probe checks that this machine rounds once (it does on x86 FMA3 and ARM64) and otherwise the
+  build runs the plain SIMD128 kernels, so results are bit-identical either way
+  (`bpp::kernel_name()` reports which ran). Relaxed SIMD needs Chrome 114+, Firefox 145+ or Node 22;
+  elsewhere the loader uses the plain build.
 
 ## Usage
 

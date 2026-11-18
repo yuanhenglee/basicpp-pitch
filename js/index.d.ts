@@ -42,8 +42,16 @@ export interface PcmFormat {
   channels?: number;
 }
 
-/** `threads: true` loads the pthreads build (needs SharedArrayBuffer). */
-export declare function loadBasicPitch(options?: { threads?: boolean } & Record<string, unknown>): Promise<BasicPitch>;
+/**
+ * `threads: true` loads the pthreads build (needs SharedArrayBuffer); `relaxed` ("auto" by
+ * default) the relaxed SIMD build where supported.
+ */
+export declare function loadBasicPitch(
+  options?: { threads?: boolean; relaxed?: boolean | "auto" } & Record<string, unknown>,
+): Promise<BasicPitch>;
+
+/** Whether this JavaScript engine supports WebAssembly relaxed SIMD. */
+export declare function hasRelaxedSimd(): boolean;
 
 export interface TranscribeOptions extends PcmFormat, NoteOptions {
   /** Called with the completed fraction as analysis windows finish; return false to cancel. */
@@ -52,6 +60,8 @@ export interface TranscribeOptions extends PcmFormat, NoteOptions {
 
 export declare class BasicPitch {
   readonly threads: number;
+  /** Network kernels in use: "simd128-relaxed", "simd128", "avx2" or "scalar". */
+  readonly kernel: string;
   transcribe(audio: Float32Array, options?: TranscribeOptions): Transcription;
   createStream(options?: PcmFormat & { threads?: number }): Stream;
   dispose(): void;

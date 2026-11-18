@@ -13,6 +13,32 @@
 
 namespace bpp::detail {
 
+const char* kernel_name() {
+#if BPP_AVX2
+    return "avx2";
+#elif BPP_RELAXED_SIMD
+    return relaxed_madd_is_fused() ? "simd128-relaxed" : "simd128";
+#elif BPP_SIMD128
+    return "simd128";
+#else
+    return "scalar";
+#endif
+}
+
+#if BPP_RELAXED_SIMD
+bool relaxed_madd_is_fused() {
+    // (1 + 2^-12)^2 = 1 + 2^-11 + 2^-24: rounded on its own the product loses the 2^-24, which a
+    // fused multiply-add keeps. Volatile inputs keep the compiler from folding the probe.
+    static const bool fused = [] {
+        volatile float x = 1.0f + 0x1p-12f, c = -(1.0f + 0x1p-11f);
+        const v128_t vx = wasm_f32x4_splat(x), vc = wasm_f32x4_splat(c);
+        const v128_t r = wasm_f32x4_relaxed_madd(vx, vx, vc);
+        return wasm_i32x4_all_true(wasm_f32x4_eq(r, wasm_f32x4_splat(0x1p-24f)));
+    }();
+    return fused;
+}
+#endif
+
 #ifdef BPP_PROFILE
 // Per-stage wall time, summed over all windows (single-threaded profiling builds only).
 namespace prof {
@@ -111,8 +137,51 @@ inline void run_rows(const RowRunner* runner, int b, int e, const std::function<
     }
 }
 
+#if BPP_RELAXED_SIMD
+// conv_contour1 with fused f32x4 FMAs: 4 output channels per vector, 6 pixels per block.
+void conv_contour1_fused(const float* hs, const float* inv_std, int t0, int t1, float* c1) {
+    using namespace data;
+    constexpr int P = 6;
+    for (int t = t0; t < t1; ++t) {
+        for (int f0 = 0; f0 < kContourBins; f0 += P) {
+            v128_t total[P][2];
+            for (auto& a : total) a[0] = a[1] = wasm_f32x4_splat(0.0f);
+            for (int kw = 0; kw < 39; ++kw) {
+                v128_t part[P][2];
+                for (auto& a : part) a[0] = a[1] = wasm_f32x4_splat(0.0f);
+                for (int kh = 0; kh < 3; ++kh) {
+                    const float* a = hs + (t + kh - 1) * kHsRow + (f0 + kw) * 8;
+                    const float* wk = kConvContour1_w + (kh * 39 + kw) * 64;
+                    for (int ic = 0; ic < 8; ++ic) {
+                        const v128_t w0 = wasm_v128_load(wk + 8 * ic), w1 = wasm_v128_load(wk + 8 * ic + 4);
+                        for (int i = 0; i < P; ++i) {
+                            const v128_t x = wasm_v128_load32_splat(a + 8 * i + ic);
+                            part[i][0] = wasm_f32x4_relaxed_madd(x, w0, part[i][0]);
+                            part[i][1] = wasm_f32x4_relaxed_madd(x, w1, part[i][1]);
+                        }
+                    }
+                }
+                for (int i = 0; i < P; ++i) {
+                    total[i][0] = wasm_f32x4_add(total[i][0], part[i][0]);
+                    total[i][1] = wasm_f32x4_add(total[i][1], part[i][1]);
+                }
+            }
+            for (int i = 0; i < P; ++i) {
+                alignas(16) float y[8];
+                wasm_v128_store(y, total[i][0]);
+                wasm_v128_store(y + 4, total[i][1]);
+                contour1_store(y, inv_std, t, f0 + i, c1);
+            }
+        }
+    }
+}
+#endif
+
 void conv_contour1(const float* hs, const float* inv_std, const double* w64, int t0, int t1, float* c1) {
     using namespace data;
+#if BPP_RELAXED_SIMD
+    if (relaxed_madd_is_fused()) return conv_contour1_fused(hs, inv_std, t0, t1, c1);
+#endif
 #if BPP_AVX2
     (void)w64;
     const __m256 vb = _mm256_loadu_ps(kConvContour1_b), vm = _mm256_loadu_ps(kBnContour_mean);
@@ -244,9 +313,36 @@ void out32_store(const Out32Conv& p, const float* acc, int t, int f) {
     }
 }
 
+#if BPP_RELAXED_SIMD
+// conv_out32_s3 with fused f32x4 FMAs: one pixel, 32 channels in 8 vectors.
+template <bool kBiasFirst, bool kBatchNorm>
+void conv_out32_s3_fused(const Out32Conv& p, int t0, int t1) {
+    for (int t = t0; t < t1; ++t) {
+        for (int f = 0; f < kNoteBins; ++f) {
+            v128_t acc[8];
+            for (int j = 0; j < 8; ++j) acc[j] = kBiasFirst ? wasm_v128_load(p.bias + 4 * j) : wasm_f32x4_splat(0.0f);
+            for (int kt = 0; kt < p.kh; ++kt) {
+                const float* a = p.in + (t + kt + p.row_off) * p.in_row + (3 * f + p.col_off) * p.in_c;
+                const float* wk = p.w + kt * p.k_len * 32;
+                for (int k = 0; k < p.k_len; ++k) {
+                    const v128_t x = wasm_v128_load32_splat(a + k);
+                    for (int j = 0; j < 8; ++j) acc[j] = wasm_f32x4_relaxed_madd(x, wasm_v128_load(wk + 32 * k + 4 * j), acc[j]);
+                }
+            }
+            alignas(16) float y[32];
+            for (int j = 0; j < 8; ++j) wasm_v128_store(y + 4 * j, acc[j]);
+            out32_store<kBiasFirst, kBatchNorm>(p, y, t, f);
+        }
+    }
+}
+#endif
+
 template <bool kBiasFirst, bool kBatchNorm>
 void conv_out32_s3(const Out32Conv& p, int t0, int t1) {
     using namespace data;
+#if BPP_RELAXED_SIMD
+    if (relaxed_madd_is_fused()) return conv_out32_s3_fused<kBiasFirst, kBatchNorm>(p, t0, t1);
+#endif
 #if BPP_AVX2
     const __m256 zero = _mm256_setzero_ps();
     for (int t = t0; t < t1; ++t) {
@@ -343,8 +439,46 @@ struct Out1Conv {
     return acc;
 }
 
+#if BPP_RELAXED_SIMD
+// out1_block with fused f32x4 FMAs: 8 * NV pixels as 2 * NV vectors, in groups of up to 11.
+template <int NV>
+void out1_block_fused(const Out1Conv& p, int t, int f0, float* out, int out_pix) {
+    constexpr int NV4 = 2 * NV, G = 11;
+    const v128_t vb = wasm_f32x4_splat(p.bias);
+    for (int g0 = 0; g0 < NV4; g0 += G) {
+        const int n = std::min(G, NV4 - g0);
+        const int fb = f0 + 4 * g0;
+        v128_t acc[G];
+        for (auto& a : acc) a = wasm_f32x4_splat(0.0f);
+        for (int i = 0; i < p.kh; ++i)
+            for (int j = 0; j < p.kw; ++j) {
+                const float* src = p.in + (t + i + p.row_off) * p.row + fb + j + p.col_off;
+                const float* wk = p.w + (i * p.kw + j) * p.n_in;
+                for (int c = 0; c < p.n_in; ++c) {
+                    const v128_t wv = wasm_v128_load32_splat(wk + c);
+                    const float* s = src + c * p.ch;
+                    for (int v = 0; v < n; ++v) acc[v] = wasm_f32x4_relaxed_madd(wasm_v128_load(s + 4 * v), wv, acc[v]);
+                }
+            }
+        for (int v = 0; v < n; ++v) {
+            const v128_t r = eigen::logistic_ps4(wasm_f32x4_add(acc[v], vb));
+            if (out_pix == 1) {
+                wasm_v128_store(out + fb + 4 * v, r);
+            } else {
+                alignas(16) float tmp[4];
+                wasm_v128_store(tmp, r);
+                for (int l = 0; l < 4; ++l) out[(fb + 4 * v + l) * out_pix] = tmp[l];
+            }
+        }
+    }
+}
+#endif
+
 template <int NV>
 void out1_block(const Out1Conv& p, int t, int f0, float* out, int out_pix) {
+#if BPP_RELAXED_SIMD
+    if (relaxed_madd_is_fused()) return out1_block_fused<NV>(p, t, f0, out, out_pix);
+#endif
 #if BPP_AVX2
     __m256 acc[NV];
     for (auto& a : acc) a = _mm256_setzero_ps();
@@ -513,6 +647,21 @@ int decimate(const float* x, int n, Workspace& ws, const double* h64) {
     }
     const float* h = data::kLowpass;
     float* out = ws.down.data();
+#if BPP_RELAXED_SIMD
+    if (relaxed_madd_is_fused()) {
+        for (int j = 0; j < n_out; j += 16) {  // 16 outputs in 4 vectors
+            v128_t acc[4];
+            for (auto& a : acc) a = wasm_f32x4_splat(0.0f);
+            for (int i = 0; i < kLowpassLen / 2; ++i) {
+                const v128_t he = wasm_v128_load32_splat(h + 2 * i), ho = wasm_v128_load32_splat(h + 2 * i + 1);
+                for (int q = 0; q < 4; ++q) acc[q] = wasm_f32x4_relaxed_madd(wasm_v128_load(e + j + i + 4 * q), he, acc[q]);
+                for (int q = 0; q < 4; ++q) acc[q] = wasm_f32x4_relaxed_madd(wasm_v128_load(o + j + i + 4 * q), ho, acc[q]);
+            }
+            for (int q = 0; q < 4; ++q) wasm_v128_store(out + j + 4 * q, acc[q]);
+        }
+        return n_out;
+    }
+#endif
 #if BPP_AVX2
     (void)h64;
     for (int j = 0; j < n_out_pad; j += 32) {
@@ -590,6 +739,33 @@ void reflect_pad(const float* x, int n, float* r) {
 template <int MR>
 void cqt_block(const float* sig, int hop, int f0, const float* w, const double* w64, int k0, int k1, float* re,
                float* im) {
+#if BPP_RELAXED_SIMD
+    if (relaxed_madd_is_fused()) {
+        for (int r0 = 0; r0 < MR; r0 += 2) {  // 2 rows x 8 bins x (re, im): 8 vectors
+            v128_t ar[2][2], ai[2][2];
+            for (int r = 0; r < 2; ++r) ar[r][0] = ar[r][1] = ai[r][0] = ai[r][1] = wasm_f32x4_splat(0.0f);
+            for (int k = k0; k < k1; ++k) {
+                const float* wk = w + (k - k0) * 16;
+                const v128_t wr0 = wasm_v128_load(wk), wr1 = wasm_v128_load(wk + 4);
+                const v128_t wi0 = wasm_v128_load(wk + 8), wi1 = wasm_v128_load(wk + 12);
+                for (int r = 0; r < 2; ++r) {
+                    const v128_t a = wasm_v128_load32_splat(sig + (f0 + r0 + r) * hop + k);
+                    ar[r][0] = wasm_f32x4_relaxed_madd(a, wr0, ar[r][0]);
+                    ar[r][1] = wasm_f32x4_relaxed_madd(a, wr1, ar[r][1]);
+                    ai[r][0] = wasm_f32x4_relaxed_madd(a, wi0, ai[r][0]);
+                    ai[r][1] = wasm_f32x4_relaxed_madd(a, wi1, ai[r][1]);
+                }
+            }
+            for (int r = 0; r < 2; ++r) {
+                wasm_v128_store(re + 8 * (r0 + r), ar[r][0]);
+                wasm_v128_store(re + 8 * (r0 + r) + 4, ar[r][1]);
+                wasm_v128_store(im + 8 * (r0 + r), ai[r][0]);
+                wasm_v128_store(im + 8 * (r0 + r) + 4, ai[r][1]);
+            }
+        }
+        return;
+    }
+#endif
 #if BPP_AVX2
     (void)w64;
     __m256 ar[MR], ai[MR];

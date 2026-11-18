@@ -23,7 +23,8 @@ const all = stream.notes();
 
 Run it in a Web Worker for long files so the page stays responsive. `loadBasicPitch({ threads: true })`
 loads the pthreads build (`basicpp_pitch_wasm_mt`, needs a cross-origin isolated page) and spreads
-the work over all cores. The `.wasm` file is loaded
+the work over all cores. Where the JavaScript engine supports relaxed SIMD, the `_rs` variants are
+used automatically (about 7x faster; `bp.kernel` tells which kernels run). The `.wasm` file is loaded
 next to `basicpp_pitch_wasm.mjs`; pass `{ locateFile }` to `loadBasicPitch` to serve it elsewhere.
 
 Build: see "WebAssembly" in the main README. This package includes libsoxr (LGPL-2.1); keep the

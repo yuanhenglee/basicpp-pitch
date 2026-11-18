@@ -26,6 +26,10 @@ int frame_count(size_t n_samples);
 // Number of analysis windows Engine::infer() runs for n_samples of 22050 Hz audio.
 int window_count(size_t n_samples);
 
+// The network kernels this build runs on this machine: "avx2", "simd128-relaxed" (fused
+// relaxed_madd confirmed at run time), "simd128" or "scalar". All give identical results.
+const char* kernel_name();
+
 // Frame-level model output, row-major [n_frames][bins], 86.13 frames per second.
 struct ModelOutput {
     int n_frames = 0;
